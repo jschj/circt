@@ -37,7 +37,7 @@ public:
 // Returns true if 'op' should be ignored in the scheduling problem.
 static bool ignoreOp(Operation *op) {
   return op->hasTrait<OpTrait::ConstantLike>() ||
-         op->hasTrait<OpTrait::ReturnLike>()
+         op->hasTrait<OpTrait::ReturnLike>();
 }
 
 void ScheduleLinearPipelinePass::runOnOperation() {
@@ -91,7 +91,7 @@ void ScheduleLinearPipelinePass::runOnOperation() {
 
   // Solve!
   assert(succeeded(problem.check()));
-  if (failed(scheduling::scheduleASAP(problem, lastOp))) {
+  if (failed(scheduling::scheduleASAP(problem))) {
     pipeline.emitError("Failed to schedule pipeline.");
     return signalPassFailure();
   }
