@@ -36,7 +36,8 @@ public:
 
 // Returns true if 'op' should be ignored in the scheduling problem.
 static bool ignoreOp(Operation *op) {
-  return isa<hw::ConstantOp, pipeline::ReturnOp>(op);
+  return op->hasTrait<OpTrait::ConstantLike>() ||
+         op->hasTrait<OpTrait::ReturnLike>()
 }
 
 void ScheduleLinearPipelinePass::runOnOperation() {
@@ -45,14 +46,14 @@ void ScheduleLinearPipelinePass::runOnOperation() {
   auto stageOpIt = pipeline.getOps<PipelineStageOp>();
   auto stageRegOpIt = pipeline.getOps<PipelineStageRegisterOp>();
 
-  if ((std::distance(stageOpIt.begin(), stageOpIt.end()) != 0) ||
-      (std::distance(stageRegOpIt.begin(), stageRegOpIt.end()) != 0)) {
+  if ((stageOpIt.begin() != stageOpIt.end()) ||
+      (stageRegOpIt.begin() != stageRegOpIt.end())) {
     pipeline.emitError("Pipeline cannot have any stages or stage registers.");
     return signalPassFailure();
   }
 
   // Load operator info from attribute.
-  auto problem = SharedOperatorsProblem::get(pipeline);
+  auto problem = Problem::get(pipeline);
   auto operatorInfo = getOperatorInfo(pipeline);
   if (!operatorInfo) {
     pipeline.emitError() << "Expected 'scheduling.operator_info' attribute on "
@@ -90,7 +91,7 @@ void ScheduleLinearPipelinePass::runOnOperation() {
 
   // Solve!
   assert(succeeded(problem.check()));
-  if (failed(scheduling::scheduleSimplex(problem, lastOp))) {
+  if (failed(scheduling::scheduleASAP(problem, lastOp))) {
     pipeline.emitError("Failed to schedule pipeline.");
     return signalPassFailure();
   }
@@ -124,7 +125,7 @@ void ScheduleLinearPipelinePass::runOnOperation() {
 
   // Reorder pipeline. Initially place unscheduled ops at the start, and then
   // all following ops in their assigned stage.
-  for (auto op : otherOps)
+  for (auto *op : otherOps)
     op->moveBefore(stages[0]);
 
   for (auto [stage, ops] : stageMap) {

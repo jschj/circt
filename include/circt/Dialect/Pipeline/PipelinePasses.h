@@ -26,6 +26,7 @@ std::unique_ptr<mlir::Pass> createScheduleLinearPipelinePass();
 #define GEN_PASS_REGISTRATION
 #include "circt/Dialect/Pipeline/PipelinePasses.h.inc"
 
+
 } // namespace pipeline
 } // namespace circt
 
