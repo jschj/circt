@@ -21,6 +21,7 @@ include "mlir/IR/RegionKindInterface.td"
 include "mlir/Interfaces/CallInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/IR/EnumAttr.td"
 
 def Pipeline_Dialect : Dialect {
@@ -192,7 +193,7 @@ def PipelineStageRegisterOp : Op<Pipeline_Dialect, "stage.register", [
   }];
 }
 
-def ReturnOp : Op<Pipeline_Dialect, "return", [Terminator]> {
+def ReturnOp : Op<Pipeline_Dialect, "return", [Terminator, ReturnLike]> {
   let summary = "Pipeline dialect return.";
   let description = [{
     The "return" operation represents a terminator of a `pipeline.pipeline`.
