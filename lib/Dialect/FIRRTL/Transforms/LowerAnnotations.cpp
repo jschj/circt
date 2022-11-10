@@ -476,6 +476,13 @@ LogicalResult LowerAnnotationsPass::applyAnnotation(DictionaryAttr anno,
   return success();
 }
 
+/// Modify the circuit to solve solve and apply all Wiring Problems in the
+/// circuit.  A Wiring Problem is a mapping from a source to a sink that should
+/// be connected via a RefType.  This uses a two-step approach.  First, all
+/// Wiring Problems are analyzed to compute pending modifications to modules.
+/// Second, modules are visited from leaves to roots to apply module
+/// modifications.  Module modifications include addings ports and connecting
+/// things up.
 LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
   // Utility function to extract the defining module from a value which may be
   // either a BlockArgument or an Operation result.
@@ -511,16 +518,28 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
     FModuleLike sourceModule = getModule(source);
     FModuleLike sinkModule = getModule(sink);
 
-    assert(!isa<FExtModuleOp>(sourceModule) && !isa<FExtModuleOp>(sinkModule) &&
-           "wiring problems involving FEXtModuleOps are currently unsupported");
+    if (isa<FExtModuleOp>(sourceModule) || isa<FExtModuleOp>(sinkModule)) {
+      auto diag = mlir::emitError(source.getLoc())
+                  << "This source is involved with a Wiring Problem which "
+                     "includes an External Module port and External Module "
+                     "ports anre not supported.";
+      diag.attachNote(sink.getLoc()) << "The sink is here.";
+      return failure();
+    }
 
     auto sourcePaths = state.instancePathCache.getAbsolutePaths(
         cast<hw::HWModuleLike>(*sourceModule));
     auto sinkPaths = state.instancePathCache.getAbsolutePaths(
         cast<hw::HWModuleLike>(*sinkModule));
 
-    assert(sourcePaths.size() == 1 && sinkPaths.size() == 1 &&
-           "source and sink must be singly instantiated");
+    if (sourcePaths.size() != 1 || sinkPaths.size() != 1) {
+      auto diag =
+          mlir::emitError(source.getLoc())
+          << "This source is involved with a Wiring Problem where the source "
+             "or the sink are multiply instantiated and this is not supported.";
+      diag.attachNote(sink.getLoc()) << "The sink is here.";
+      return failure();
+    }
 
     FModuleOp lca =
         cast<FModuleOp>(instanceGraph.getTopLevelNode()->getModule());
