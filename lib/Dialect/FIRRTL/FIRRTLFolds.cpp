@@ -2056,6 +2056,55 @@ static bool isPortUnused(Value port, StringRef data) {
   return true;
 }
 
+// Remove accesses to a port which is used.
+static void erasePort(PatternRewriter &rewriter, Value port) {
+  // Find the clock field of the port and determine whether the port is
+  // accessed only through its subfields or as a whole wire.  If the port
+  // is used in its entirety, replace it with a wire.  Otherwise,
+  // eliminate individual subfields and replace with reasonable defaults.
+  auto clkIndex = port.getType().cast<BundleType>().getElementIndex("clk");
+  Value clock;
+  for (auto *op : port.getUsers()) {
+    auto subfield = dyn_cast<SubfieldOp>(op);
+    if (!subfield) {
+      auto dummyWire = rewriter.create<WireOp>(port.getLoc(), port.getType());
+      port.replaceAllUsesWith(dummyWire);
+      return;
+    }
+    if (subfield.getFieldIndex() == clkIndex)
+      clock = getDriverFromConnect(subfield);
+  }
+
+  // Remove all connects to field accesses as they are no longer relevant.
+  // If field values are used anywhere, which should happen solely for read
+  // ports, a dummy register is introduced which replicates the behaviour of
+  // memory that is never written, but might be read.
+  for (auto *accessOp : llvm::make_early_inc_range(port.getUsers())) {
+    auto access = cast<SubfieldOp>(accessOp);
+    for (auto *user : llvm::make_early_inc_range(access->getUsers())) {
+      auto connect = dyn_cast<FConnectLike>(user);
+      if (connect && connect.getDest() == access) {
+        rewriter.eraseOp(user);
+        continue;
+      }
+    }
+    if (access.use_empty()) {
+      rewriter.eraseOp(access);
+      continue;
+    }
+
+    // Replace read values with a register that is never written, handing off
+    // the canonicalization of such a register to another canonicalizer.
+    auto ty = access.getType();
+    if (!clock)
+      clock = rewriter.create<SpecialConstantOp>(
+          access.getLoc(), ClockType::get(rewriter.getContext()), false);
+    Value reg = rewriter.create<RegOp>(access.getLoc(), ty, clock);
+    rewriter.replaceOp(access, reg);
+  }
+  assert(port.use_empty() && "port should have no remaining uses");
+}
+
 namespace {
 // If memory has known, but zero width, eliminate it.
 struct FoldZeroWidthMemory : public mlir::RewritePattern {
@@ -2120,10 +2169,8 @@ struct FoldReadOrWriteOnlyMemory : public mlir::RewritePattern {
     }
     assert((!isWritten || !isRead) && "memory is in use");
 
-    for (auto port : mem.getResults()) {
-      auto dummyWire = rewriter.create<WireOp>(port.getLoc(), port.getType());
-      port.replaceAllUsesWith(dummyWire);
-    }
+    for (auto port : mem.getResults())
+      erasePort(rewriter, port);
 
     rewriter.eraseOp(op);
     return success();
@@ -2190,12 +2237,10 @@ struct FoldUnusedPorts : public mlir::RewritePattern {
     // Replace the dead ports with dummy wires.
     unsigned nextPort = 0;
     for (auto [i, port] : llvm::enumerate(mem.getResults())) {
-      if (deadPorts[i]) {
-        auto dummyWire = rewriter.create<WireOp>(port.getLoc(), port.getType());
-        port.replaceAllUsesWith(dummyWire);
-      } else {
+      if (deadPorts[i])
+        erasePort(rewriter, port);
+      else
         port.replaceAllUsesWith(newOp.getResult(nextPort++));
-      }
     }
 
     rewriter.eraseOp(op);
