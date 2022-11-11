@@ -10,9 +10,14 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Dialect/HW/HWOpInterfaces.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/StringRef.h"
+
+using namespace mlir;
+using namespace llvm;
+using namespace circt::hw;
 
 #include "circt/Dialect/HW/HWOpInterfaces.cpp.inc"

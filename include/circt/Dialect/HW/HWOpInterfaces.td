@@ -157,4 +157,23 @@ def HWInstanceLike : OpInterface<"HWInstanceLike"> {
   ];
 }
 
+def Clocked : OpInterface<"Clocked"> {
+  let cppNamespace = "circt::seq";
+  let description = "Trait for clocked elements";
+
+  let methods = [
+    InterfaceMethod<"Get the clock signal", "Value", "getClk", (ins)>
+  ];
+}
+
+def Resettable : OpInterface<"Resettable"> {
+  let cppNamespace = "circt::seq";
+  let description = "Trait for Resettable elements";
+
+  let methods = [
+    InterfaceMethod<"Get the reset signal", "Value", "getReset", (ins)>,
+    InterfaceMethod<"Get the reset value", "Value", "getResetValue", (ins)>
+  ];
+}
+
 #endif
