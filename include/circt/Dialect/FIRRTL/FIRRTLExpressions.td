@@ -130,15 +130,15 @@ def AggregateConstantOp : FIRRTLOp<"aggregateconstant", [Pure, ConstantLike]> {
   let description = [{
     The constant operations produces a constant value of an aggregate type.  The
     type must be passive.  Clock and reset values are supported.
-    For nested aggregates, values are applied in depth-first fassion.
+    For nested aggregates, embedded arrays are used.
     ```
-      %result = firrtl.aggregateconstant 1, 2, 3 : !firrtl.bundle<a: uint<8>, b: uint<5>, c: uint<4>>
-      %result = firrtl.aggregateconstant 1, 2, 3 : !firrtl.vector<uint<8>, 3>
-
+      %result = firrtl.aggregateconstant [1, 2, 3] : !firrtl.bundle<a: uint<8>, b: uint<5>, c: uint<4>>
+      %result = firrtl.aggregateconstant [1, 2, 3] : !firrtl.vector<uint<8>, 3>
+      %result = firrtl.aggregateconstant [[1, 2], [3, 5]] : !firrtl.vector<!firrtl.bundle<a: uint<8>, b: uint<5>>, 2>
     ```
   }];
 
-  let arguments = (ins TypedArrayAttrBase<APSIntAttr, "field constants">:$fields);
+  let arguments = (ins ArrayAttr:$fields);
   let results = (outs AggregateType:$result);
 
   let assemblyFormat = "$fields attr-dict `:` type($result)";
@@ -220,7 +220,7 @@ def SubfieldOp : FIRRTLExprOp<"subfield"> {
   let hasFolder = 1;
   let hasCanonicalizer = 1;
   let hasVerifier = 1;
-  
+
   // TODO: Could drop the result type, inferring it from the source.
   let assemblyFormat =
     "$input `(` $fieldIndex `)` attr-dict `:` functional-type($input, $result)";
@@ -265,7 +265,6 @@ def SubindexOp : FIRRTLExprOp<"subindex", [
   let hasFolder = 1;
   let hasCanonicalizer = 1;
 
-  // TODO: Could drop the result type, inferring it from the source.
   let assemblyFormat =
      "$input `[` $index `]` attr-dict `:` qualified(type($input))";
 
@@ -297,7 +296,7 @@ def SubaccessOp : FIRRTLExprOp<"subaccess", [
   let assemblyFormat =
      "$input `[` $index `]` attr-dict `:` qualified(type($input)) `,` qualified(type($index))";
 
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 
 def MultibitMuxOp : FIRRTLExprOp<"multibit_mux"> {
@@ -313,7 +312,7 @@ def MultibitMuxOp : FIRRTLExprOp<"multibit_mux"> {
     For the example above, if `%index` is 0, then the value is `%v_0`.
     }];
 
-  let arguments = (ins FIRRTLBaseType:$index, Variadic<FIRRTLBaseType>:$inputs);
+  let arguments = (ins UIntType:$index, Variadic<FIRRTLBaseType>:$inputs);
   let results = (outs FIRRTLBaseType:$result);
   let hasCustomAssemblyFormat = 1;
   let hasFolder = true;
@@ -374,7 +373,7 @@ class IntBinaryPrimOp<string mnemonic, Type resultType,
                 traits # [SameOperandsIntTypeKind]>;
 
 let inferType = "impl::inferAddSubResult" in {
-  let hasCanonicalizeMethod = true in {
+  let hasCanonicalizer = true in {
     def AddPrimOp : IntBinaryPrimOp<"add", IntType, [Commutative]>;
     def SubPrimOp : IntBinaryPrimOp<"sub", IntType>;
   }
@@ -396,9 +395,11 @@ def DivPrimOp : IntBinaryPrimOp<"div", IntType> {
 }
 def RemPrimOp : IntBinaryPrimOp<"rem", IntType>;
 let inferType = "impl::inferBitwiseResult" in {
-  def AndPrimOp : IntBinaryPrimOp<"and", UIntType, [Commutative]>;
-  def OrPrimOp  : IntBinaryPrimOp<"or",  UIntType, [Commutative]>;
-  def XorPrimOp : IntBinaryPrimOp<"xor", UIntType, [Commutative]>;
+  let hasCanonicalizer = true in {
+    def AndPrimOp : IntBinaryPrimOp<"and", UIntType, [Commutative]>;
+    def OrPrimOp  : IntBinaryPrimOp<"or",  UIntType, [Commutative]>;
+    def XorPrimOp : IntBinaryPrimOp<"xor", UIntType, [Commutative]>;
+  }
 }
 
 // Comparison Operations
@@ -416,14 +417,14 @@ let inferType = "impl::inferComparisonResult" in {
 }
 
 def CatPrimOp : IntBinaryPrimOp<"cat", UIntType> {
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 def DShlPrimOp  : BinaryPrimOp<"dshl", IntType, UIntType, IntType>  {
   let description = [{
     A dynamic shift left operation. The width of `$result` is expanded to
     `width($lhs) + 1 << width($rhs) - 1`.
   }];
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 def DShlwPrimOp : BinaryPrimOp<"dshlw", IntType, UIntType, IntType> {
   let description = [{
@@ -432,7 +433,7 @@ def DShlwPrimOp : BinaryPrimOp<"dshlw", IntType, UIntType, IntType> {
   }];
 }
 def DShrPrimOp  : BinaryPrimOp<"dshr", IntType, UIntType, IntType> {
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -520,7 +521,7 @@ def BitsPrimOp : PrimOp<"bits"> {
     The result is `hi - lo + 1` bits wide.
   }];
 
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 
 def HeadPrimOp : PrimOp<"head"> {
@@ -612,9 +613,9 @@ def TailPrimOp : PrimOp<"tail"> {
 def IsXVerifOp : FIRRTLExprOp<"verif_isX"> {
   let summary = "Test for 'x";
   let description = [{
-    The verif.isX expression checks that the operand is not a verilog literal 
-    'x.  Firrtl doesn't have a notion of 'x per-se, but x can come in to the 
-    system from external modules and from SV constructs.  Verification 
+    The verif.isX expression checks that the operand is not a verilog literal
+    'x.  Firrtl doesn't have a notion of 'x per-se, but x can come in to the
+    system from external modules and from SV constructs.  Verification
     constructs need to explicitly test for 'x.
     }];
 
@@ -761,12 +762,6 @@ class RefResultTypeConstraint<string base, string ref>
   : TypesMatchWith<"reference base type should match",
                    base, ref,
                    "RefType::get($_self.cast<FIRRTLBaseType>())">;
-
-def RefInstancePortConstraint
-  : PredOpTrait<"it cannot have module port as an operand because it implies"
-  " upward reference XMR, which are not supported."
-  " The reference operand must be a port from firrtl.instance",
-                CPred<"!($ref.isa<BlockArgument>())">>;
 
 //===----------------------------------------------------------------------===//
 // RefOps

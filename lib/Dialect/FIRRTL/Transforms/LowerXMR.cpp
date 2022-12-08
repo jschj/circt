@@ -59,6 +59,10 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
             // Get a reference to the actual signal to which the XMR will be
             // generated.
             Value xmrDef = send.getBase();
+            if (isZeroWidth(send.getType().getType())) {
+              markForRemoval(send);
+              return success();
+            }
             // Get an InnerRefAttr to the xmrDef op. If the operation does not
             // take any InnerSym (like firrtl.add, firrtl.or etc) then create a
             // NodeOp to add the InnerSym.
@@ -130,6 +134,9 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
             if (!connect.getSrc().getType().isa<RefType>())
               return success();
             markForRemoval(connect);
+            if (isZeroWidth(
+                    connect.getSrc().getType().cast<RefType>().getType()))
+              return success();
             // Merge the dataflow classes of destination into the source of the
             // Connect. This handles two cases:
             // 1. If the dataflow at the source is known, then the
@@ -147,6 +154,8 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
           })
           .Case<RefSubOp>([&](RefSubOp op) {
             markForRemoval(op);
+            if (isZeroWidth(op.getType().getType()))
+              return success();
             auto defMem = dyn_cast<MemOp>(op.getInput().getDefiningOp());
             if (!defMem) {
               defMem.emitOpError("can only lower RefSubOp of Memory");
@@ -169,9 +178,10 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
             // XMRs. That is, RefResolveOp can be visited before the
             // corresponding RefSendOp is recorded.
 
-            dataFlowClasses.unionSets(resolve.getRef(), resolve.getResult());
-            resolveOps.push_back(resolve);
             markForRemoval(resolve);
+            if (!isZeroWidth(resolve.getType()))
+              dataFlowClasses.unionSets(resolve.getRef(), resolve.getResult());
+            resolveOps.push_back(resolve);
             return success();
           })
           .Default([&](auto) { return success(); });
@@ -343,7 +353,8 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
       // Reference ports must be removed.
       setPortToRemove(inst, portNum, numPorts);
       // Drop the dead-instance-ports.
-      if (instanceResult.use_empty())
+      if (instanceResult.use_empty() ||
+          isZeroWidth(instanceResult.getType().cast<RefType>().getType()))
         continue;
       auto refModuleArg = refMod.getArgument(portNum);
       if (inst.getPortDirection(portNum) == Direction::Out) {
@@ -499,6 +510,8 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
     refSendPathList.clear();
   }
 
+  bool isZeroWidth(FIRRTLBaseType t) { return t.getBitWidthOrSentinel() == 0; }
+
   /// Cached module namespaces.
   DenseMap<Operation *, ModuleNamespace> moduleNamespaces;
 
@@ -516,8 +529,7 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
   /// nextNodeOnPath. Only the node representing the final XMR defining op has
   /// no nextNodeOnPath, which denotes a leaf node on the path.
   using nextNodeOnPath = Optional<size_t>;
-  using innerRefToVal = Attribute;
-  using node = std::pair<innerRefToVal, nextNodeOnPath>;
+  using node = std::pair<Attribute, nextNodeOnPath>;
   SmallVector<node> refSendPathList;
 
   /// llvm::EquivalenceClasses wants comparable elements. This comparator uses

@@ -1,8 +1,34 @@
 // RUN: circt-opt %s | circt-opt | FileCheck %s
-// RUN: circt-opt %s -test-ssp-roundtrip | circt-opt | FileCheck %s
+// RUN: circt-opt %s -ssp-roundtrip | circt-opt | FileCheck %s
 
 // 1) tests the plain parser/printer roundtrip.
 // 2) roundtrips via the scheduling infra (i.e. populates a `Problem` instance and reconstructs the SSP IR from it.)
+
+// CHECK: ssp.instance of "Problem" {
+// CHECK:   library {
+// CHECK:   }
+// CHECK:   graph {
+// CHECK:   }
+// CHECK: }
+ssp.instance of "Problem" {
+  library {
+  }
+  graph {
+  }
+}
+
+// CHECK: ssp.instance @named_library of "Problem" {
+// CHECK:   library @myLib {
+// CHECK:   }
+// CHECK:   graph {
+// CHECK:   }
+// CHECK: }
+ssp.instance @named_library of "Problem" {
+  library @myLib {
+  }
+  graph {
+  }
+}
 
 // CHECK: ssp.instance @"no properties" of "Problem" {
 // CHECK:   library {  
@@ -84,6 +110,33 @@ ssp.instance @self_arc of "CyclicProblem" [II<3>] {
     %0 = operation<@unit>() [t<0>]
     %1 = operation<@_3> @self(%0, %0, @self [dist<1>]) [t<1>]
     operation<@unit>(%1) [t<4>]
+  }
+}
+
+// CHECK: ssp.instance @mco_outgoing_delays of "ChainingProblem" {
+// CHECK:   library {
+// CHECK:     operator_type @add [latency<2>, incDelay<1.000000e-01 : f32>, outDelay<1.000000e-01 : f32>]
+// CHECK:     operator_type @mul [latency<3>, incDelay<5.000000e+00 : f32>, outDelay<1.000000e-01 : f32>]
+// CHECK:     operator_type @ret [latency<0>, incDelay<0.000000e+00 : f32>, outDelay<0.000000e+00 : f32>]
+// CHECK:   }
+// CHECK:   graph {
+// CHECK:     %[[op_0:.*]] = operation<@add>() [t<0>, z<0.000000e+00 : f32>]
+// CHECK:     %[[op_1:.*]] = operation<@mul>(%[[op_0]], %[[op_0]]) [t<3>, z<0.000000e+00 : f32>]
+// CHECK:     %[[op_2:.*]] = operation<@add>(%[[op_1]], %[[op_1]]) [t<6>, z<1.000000e-01 : f32>]
+// CHECK:     operation<@ret>(%[[op_2]]) [t<8>, z<1.000000e-01 : f32>]
+// CHECK:   }
+// CHECK: }
+ssp.instance @mco_outgoing_delays of "ChainingProblem" {
+  library {
+    operator_type @add [latency<2>, incDelay<1.000000e-01 : f32>, outDelay<1.000000e-01 : f32>]
+    operator_type @mul [latency<3>, incDelay<5.000000e+00 : f32>, outDelay<1.000000e-01 : f32>]
+    operator_type @ret [latency<0>, incDelay<0.000000e+00 : f32>, outDelay<0.000000e+00 : f32>]
+  }
+  graph {
+    %0 = operation<@add>() [t<0>, z<0.000000e+00 : f32>]
+    %1 = operation<@mul>(%0, %0) [t<3>, z<0.000000e+00 : f32>]
+    %2 = operation<@add>(%1, %1) [t<6>, z<1.000000e-01 : f32>]
+    operation<@ret>(%2) [t<8>, z<1.000000e-01 : f32>]
   }
 }
 

@@ -339,11 +339,11 @@ firrtl.circuit "DuplicateNLAs" {
   firrtl.hierpath private @annos_nla_1 [@Mid_1::@core, @Core_1]
   firrtl.hierpath private @annos_nla_2 [@Mid_2::@core, @Core_2]
   firrtl.hierpath private @annos_nla_3 [@Mid_3::@core, @Core_3]
-  
+
   // CHECK: firrtl.hierpath private [[NLA0:@.+]] [@DuplicateNLAs::@core_3, @Mid_1::@core, @Core_1]
   // CHECK: firrtl.hierpath private [[NLA1:@.+]] [@DuplicateNLAs::@core_2, @Mid_1::@core, @Core_1]
   // CHECK: firrtl.hierpath private [[NLA2:@.+]] [@DuplicateNLAs::@core_1, @Mid_1::@core, @Core_1]
-  
+
   firrtl.module @DuplicateNLAs() {
     firrtl.instance core_1 sym @core_1 @Mid_1()
     firrtl.instance core_2 sym @core_2 @Mid_2()
@@ -623,25 +623,25 @@ firrtl.circuit "Foo"  {
 firrtl.circuit "LimitLoc" {
   // CHECK: @Simple0
   // CHECK-NEXT: loc(#loc[[num:.+]])
-  firrtl.module @Simple0() { } loc(#loc0) 
+  firrtl.module @Simple0() { } loc(#loc0)
   // CHECK-NOT: @Simple1
-  firrtl.module @Simple1() { } loc(#loc1) 
+  firrtl.module @Simple1() { } loc(#loc1)
   // CHECK-NOT: @Simple2
-  firrtl.module @Simple2() { } loc(#loc2) 
+  firrtl.module @Simple2() { } loc(#loc2)
   // CHECK-NOT: @Simple3
-  firrtl.module @Simple3() { } loc(#loc3) 
+  firrtl.module @Simple3() { } loc(#loc3)
   // CHECK-NOT: @Simple4
-  firrtl.module @Simple4() { } loc(#loc4) 
+  firrtl.module @Simple4() { } loc(#loc4)
   // CHECK-NOT: @Simple5
-  firrtl.module @Simple5() { } loc(#loc5) 
+  firrtl.module @Simple5() { } loc(#loc5)
   // CHECK-NOT: @Simple6
-  firrtl.module @Simple6() { } loc(#loc6) 
+  firrtl.module @Simple6() { } loc(#loc6)
   // CHECK-NOT: @Simple7
-  firrtl.module @Simple7() { } loc(#loc7) 
+  firrtl.module @Simple7() { } loc(#loc7)
   // CHECK-NOT: @Simple8
-  firrtl.module @Simple8() { } loc(#loc8) 
+  firrtl.module @Simple8() { } loc(#loc8)
   // CHECK-NOT: @Simple9
-  firrtl.module @Simple9() { } loc(#loc9) 
+  firrtl.module @Simple9() { } loc(#loc9)
   firrtl.module @LimitLoc() {
     firrtl.instance simple0 @Simple0()
     firrtl.instance simple1 @Simple1()
@@ -665,4 +665,12 @@ firrtl.circuit "LimitLoc" {
   #loc7 = loc("A.fir":7:1)
   #loc8 = loc("A.fir":8:1)
   #loc9 = loc("A.fir":9:1)
-// CHECK: loc[[num]] = loc(fused["A.fir":0:1, "A.fir":1:1, "A.fir":2:1, "A.fir":3:1, "A.fir":4:1, "A.fir":5:1, "A.fir":6:1, "A.fir":7:1])
+// CHECK: [[L1:#loc.*]] = loc("A.fir":0:1)
+// CHECK: [[L2:#loc.*]] = loc("A.fir":1:1)
+// CHECK: [[L3:#loc.*]] = loc("A.fir":2:1)
+// CHECK: [[L4:#loc.*]] = loc("A.fir":3:1)
+// CHECK: [[L5:#loc.*]] = loc("A.fir":4:1)
+// CHECK: [[L6:#loc.*]] = loc("A.fir":5:1)
+// CHECK: [[L7:#loc.*]] = loc("A.fir":6:1)
+// CHECK: [[L8:#loc.*]] = loc("A.fir":7:1)
+// CHECK: #loc[[num]] = loc(fused[[[L1]], [[L2]], [[L3]], [[L4]], [[L5]], [[L6]], [[L7]], [[L8]]])

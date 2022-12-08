@@ -1278,8 +1278,17 @@ void InterfaceModportOp::build(OpBuilder &builder, OperationState &state,
   build(builder, state, name, ArrayAttr::get(ctxt, directions));
 }
 
+/// Suggest a name for each result value based on the saved result names
+/// attribute.
+void InterfaceInstanceOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  setNameFn(getResult(), getName());
+}
+
 /// Ensure that the symbol being instantiated exists and is an InterfaceOp.
 LogicalResult InterfaceInstanceOp::verify() {
+  if (getName().empty())
+    return emitOpError("requires non-empty name");
+
   auto *symtable = SymbolTable::getNearestSymbolTable(*this);
   if (!symtable)
     return emitError("sv.interface.instance must exist within a region "
@@ -1472,8 +1481,10 @@ LogicalResult WireOp::canonicalize(WireOp wire, PatternRewriter &rewriter) {
 
   Value connected;
   if (!write) {
-    // If no write and only reads, then replace with XOp.
-    connected = rewriter.create<ConstantXOp>(
+    // If no write and only reads, then replace with ZOp.
+    // SV 6.6: "If no driver is connected to a net, its
+    // value shall be high-impedance (z) unless the net is a trireg"
+    connected = rewriter.create<ConstantZOp>(
         wire.getLoc(),
         wire.getResult().getType().cast<InOutType>().getElementType());
   } else if (isa<hw::HWModuleOp>(write->getParentOp()))

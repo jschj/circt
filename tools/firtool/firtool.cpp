@@ -48,6 +48,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
 
@@ -306,10 +307,11 @@ static cl::opt<bool>
                             cl::desc("Disable the MergeConnections pass"),
                             cl::init(false), cl::Hidden, cl::cat(mainCategory));
 
-static cl::opt<bool>
-    mergeConnectionsAgggresively("merge-connections-aggressive-merging",
-                                 cl::desc("Merge connections aggressively"),
-                                 cl::init(false), cl::cat(mainCategory));
+static cl::opt<bool> disableAggressiveMergeConnections(
+    "disable-aggressive-merge-connections",
+    cl::desc("Disable aggressive merge connections (i.e. merge all field-level "
+             "connections into bulk connections)"),
+    cl::init(false), cl::cat(mainCategory));
 
 /// Enable the pass to merge the read and write ports of a memory, if their
 /// enable conditions are mutually exclusive.
@@ -326,6 +328,15 @@ static cl::opt<bool> etcDisableInstanceExtraction(
 static cl::opt<bool> etcDisableModuleInlining(
     "etc-disable-module-inlining",
     cl::desc("Disable inlining modules that only feed test code"),
+    cl::init(false), cl::cat(mainCategory));
+
+static cl::opt<bool> addVivadoRAMAddressConflictSynthesisBugWorkaround(
+    "add-vivado-ram-address-conflict-synthesis-bug-workaround",
+    cl::desc(
+        "Add a vivado specific SV attribute (* ram_style = \"distributed\" *) "
+        "to array registers as a workaronud for a vivado synthesis bug that "
+        "incorrectly modifies address conflict behavivor of combinational "
+        "memories"),
     cl::init(false), cl::cat(mainCategory));
 
 enum class RandomKind { None, Mem, Reg, All };
@@ -736,6 +747,9 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
   pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
       firrtl::createDropNamesPass(preserveMode));
 
+  // Run InnerSymbolDCE as late as possible, but before IMDCE.
+  pm.addPass(firrtl::createInnerSymbolDCEPass());
+
   // The above passes, IMConstProp in particular, introduce additional
   // canonicalization opportunities that we should pick up here before we
   // proceed to output-specific pipelines.
@@ -754,7 +768,8 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
       preserveAggregate != firrtl::PreserveAggregate::None &&
       !disableMergeConnections)
     pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
-        firrtl::createMergeConnectionsPass(mergeConnectionsAgggresively));
+        firrtl::createMergeConnectionsPass(
+            !disableAggressiveMergeConnections.getValue()));
 
   // Lower if we are going to verilog or if lowering was specifically requested.
   if (outputFormat != OutputIRFir) {
@@ -792,12 +807,14 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
         modulePM.addPass(createCSEPass());
       }
 
-      pm.nest<hw::HWModuleOp>().addPass(
-          seq::createSeqFIRRTLLowerToSVPass(!isRandomEnabled(RandomKind::Reg)));
-      pm.addPass(sv::createHWMemSimImplPass(replSeqMem, ignoreReadEnableMem,
-                                            stripMuxPragmas,
-                                            !isRandomEnabled(RandomKind::Mem),
-                                            !isRandomEnabled(RandomKind::Reg)));
+      pm.nest<hw::HWModuleOp>().addPass(seq::createSeqFIRRTLLowerToSVPass(
+          {/*disableRandomization=*/!isRandomEnabled(RandomKind::Reg),
+           /*addVivadoRAMAddressConflictSynthesisBugWorkaround=*/
+           addVivadoRAMAddressConflictSynthesisBugWorkaround}));
+      pm.addPass(sv::createHWMemSimImplPass(
+          replSeqMem, ignoreReadEnableMem, stripMuxPragmas,
+          !isRandomEnabled(RandomKind::Mem), !isRandomEnabled(RandomKind::Reg),
+          addVivadoRAMAddressConflictSynthesisBugWorkaround));
 
       if (extractTestCode)
         pm.addPass(sv::createSVExtractTestCodePass(etcDisableInstanceExtraction,
@@ -1029,6 +1046,10 @@ static LogicalResult executeFirtool(MLIRContext &context) {
 /// MLIRContext and modules inside of it (reducing compile time).
 int main(int argc, char **argv) {
   InitLLVM y(argc, argv);
+
+  // Set the bug report message to indicate users should file issues on
+  // llvm/circt and not llvm/llvm-project.
+  setBugReportMsg(circtBugReportMsg);
 
   // Hide default LLVM options, other than for this tool.
   // MLIR options are added below.

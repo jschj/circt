@@ -3,6 +3,7 @@
 ; RUN: firtool --annotation-file %s.anno.json --annotation-file %s.Extract.anno.json %s --annotation-file %s.YAML.anno.json | FileCheck %s --check-prefixes YAML
 ; RUN: firtool --split-verilog --annotation-file %s.anno.json %s -o %t.folder > %t  && cat %t.folder/MyView_companion.sv | FileCheck %s --check-prefixes MYVIEW_COMPANION
 ; RUN: firtool --annotation-file %s.anno.json --annotation-file %s.Prefix.anno.json %s | FileCheck %s --check-prefixes PREFIX
+; RUN: firtool --annotation-file %s.anno.json %s --disable-opt
 
 circuit Top :
   extmodule BlackBox_DUT :
@@ -57,6 +58,8 @@ circuit Top :
     output a: UInt<1>
     input b: UInt<1>
 
+  extmodule ExtModuleWithPort:
+    output source: UInt<1>[2]
 
   ; This checks that macro definitions (e.g. "define RANDOM") are included
   ; in MyView_companion.sv. There was a bug that macro definitions were not
@@ -143,6 +146,8 @@ circuit Top :
     inst bbox2 of BlackBox_DUTAndGCT
     bbox2.a <= in.uint
 
+    inst ext of ExtModuleWithPort
+
   module Top :
     input clock : Clock
     input reset : UInt<1>
@@ -210,6 +215,7 @@ circuit Top :
     ; NOEXTRACT-NEXT:   assign MyView.sub_vecOfBundle[0].uint = DUT.submodule.w_vecOfBundle_0_uint;
     ; NOEXTRACT-NEXT:   assign MyView.sub_vecOfBundle[1].sint = DUT.submodule.w_vecOfBundle_1_sint;
     ; NOEXTRACT-NEXT:   assign MyView.sub_vecOfBundle[1].uint = DUT.submodule.w_vecOfBundle_1_uint;
+    ; NOEXTRACT-NEXT:   assign MyView.ext_port_1 = DUT.
     ; NOEXTRACT:        Tap tap (
     ; NOEXTRACT-NEXT:     .b     (r),
     ; NOEXTRACT-NEXT:     .clock (clock),
@@ -260,6 +266,7 @@ circuit Top :
     ; EXTRACT-NEXT:     assign MyView.sub_vecOfBundle[0].uint = DUT.submodule.in_vecOfBundle_0_uint;
     ; EXTRACT-NEXT:     assign MyView.sub_vecOfBundle[1].sint = DUT.submodule.in_vecOfBundle_1_sint;
     ; EXTRACT-NEXT:     assign MyView.sub_vecOfBundle[1].uint = DUT.submodule.in_vecOfBundle_1_uint;
+    ; EXTRACT-NEXT:     assign MyView.ext_port_1 = DUT.
     ; EXTRACT:          Tap tap (
     ; EXTRACT-NEXT:       .b     (r),
     ; EXTRACT-NEXT:       .clock (_tap_clock),
@@ -293,6 +300,8 @@ circuit Top :
     ; CHECK-NEXT:       // a vector of a bundle in the submodule with a
     ; CHECK-NEXT:       // multiline comment
     ; CHECK-NEXT:       Sub_vecOfBundle sub_vecOfBundle[2]();
+    ; CHECK-NEXT:       // The second element of an external port
+    ; CHECK-NEXT:       logic ext_port_1;
     ; CHECK-NEXT:     endinterface
 
     ; EXTRACT:        FILE "Wire{{[/\]}}firrtl{{[/\]}}gct{{[/\]}}VecOfBundle.sv"
@@ -348,6 +357,10 @@ circuit Top :
     ; YAML-NEXT:            - name: sub_vec
     ; YAML-NEXT:              description: 'a vector called ''vec'' in the submodule'
     ; YAML-NEXT:              dimensions: [ 2 ]
+    ; YAML-NEXT:              width: 1
+    ; YAML-NEXT:            - name: ext_port_1
+    ; YAML-NEXT:              description: The second element of an external port
+    ; YAML-NEXT:              dimensions: [ ]
     ; YAML-NEXT:              width: 1
     ; YAML-NEXT:          instances:
     ; YAML-NEXT:            - name: vecOfBundle
