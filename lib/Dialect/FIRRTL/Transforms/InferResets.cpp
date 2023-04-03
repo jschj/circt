@@ -75,7 +75,7 @@ struct ResetDomain {
 
   // Implementation details for this domain.
   Value existingValue;
-  Optional<unsigned> existingPort;
+  std::optional<unsigned> existingPort;
   StringAttr newPortName;
 
   ResetDomain(Value reset) : reset(reset) {}
@@ -128,11 +128,11 @@ static Value createZeroValue(ImplicitLocOpBuilder &builder, FIRRTLBaseType type,
           })
           .Case<SIntType, UIntType>([&](auto type) {
             return builder.create<ConstantOp>(
-                type, APInt::getNullValue(type.getWidth().value_or(1)));
+                type, APInt::getZero(type.getWidth().value_or(1)));
           })
           .Case<BundleType>([&](auto type) {
             auto wireOp = builder.create<WireOp>(type);
-            for (auto &field : llvm::enumerate(type)) {
+            for (auto field : llvm::enumerate(type)) {
               auto zero = createZeroValue(builder, field.value().type, cache);
               auto acc = builder.create<SubfieldOp>(field.value().type, wireOp,
                                                     field.index());
@@ -353,7 +353,7 @@ namespace {
 ///
 /// 5. For every module in the design, determine the full async reset domain it
 ///    is in. Note that this very narrowly deals with the inference of a
-///    "default" async reset, which bascially goes through the IR and attaches
+///    "default" async reset, which basically goes through the IR and attaches
 ///    all non-reset registers to a default async reset signal. If a module
 ///    carries one of the annotations mentioned in (4), the annotated port or
 ///    wire is used as its reset domain. Otherwise, it inherits the reset domain
@@ -733,7 +733,7 @@ void InferResetsPass::traceResets(CircuitOp circuit) {
       llvm::dbgs() << "\n===----- Tracing uninferred resets -----===\n\n");
   circuit.walk([&](Operation *op) {
     TypeSwitch<Operation *>(op)
-        .Case<ConnectOp, StrictConnectOp>([&](auto op) {
+        .Case<FConnectLike>([&](auto op) {
           traceResets(op.getDest(), op.getSrc(), op.getLoc());
         })
 
@@ -741,14 +741,14 @@ void InferResetsPass::traceResets(CircuitOp circuit) {
         .Case<RefSendOp>([&](auto op) {
           // Trace using base types.
           traceResets(op.getType().getType(), op.getResult(), 0,
-                      op.getBase().getType().template cast<FIRRTLBaseType>(),
-                      op.getBase(), 0, op.getLoc());
+                      op.getBase().getType().getPassiveType(), op.getBase(), 0,
+                      op.getLoc());
         })
         .Case<RefResolveOp>([&](auto op) {
           // Trace using base types.
           traceResets(op.getType(), op.getResult(), 0,
-                      op.getRef().getType().template cast<RefType>().getType(),
-                      op.getRef(), 0, op.getLoc());
+                      op.getRef().getType().getType(), op.getRef(), 0,
+                      op.getLoc());
         })
 
         .Case<InvalidValueOp>([&](auto op) {
@@ -776,7 +776,7 @@ void InferResetsPass::traceResets(CircuitOp circuit) {
 
         .Case<SubfieldOp>([&](auto op) {
           // Associate the input bundle's resets with the output field's resets.
-          auto bundleType = op.getInput().getType().template cast<BundleType>();
+          auto bundleType = op.getInput().getType();
           auto index = op.getFieldIndex();
           traceResets(op.getType(), op.getResult(), 0,
                       bundleType.getElements()[index].type, op.getInput(),
@@ -795,8 +795,7 @@ void InferResetsPass::traceResets(CircuitOp circuit) {
           // connected. However for the sake of type inference, this is
           // indistinguishable from them having to share the same type (namely
           // the vector element type).
-          auto vectorType =
-              op.getInput().getType().template cast<FVectorType>();
+          auto vectorType = op.getInput().getType();
           traceResets(op.getType(), op.getResult(), 0,
                       vectorType.getElementType(), op.getInput(),
                       getFieldID(vectorType), op.getLoc());
@@ -985,8 +984,10 @@ FailureOr<ResetKind> InferResetsPass::inferReset(ResetNetwork net) {
   // Handle the case where we have no votes for either kind.
   if (asyncDrives == 0 && syncDrives == 0 && invalidDrives == 0) {
     ResetSignal root = guessRoot(net);
-    mlir::emitError(root.field.getValue().getLoc())
-        << "reset network never driven with concrete type";
+    auto diag = mlir::emitError(root.field.getValue().getLoc())
+                << "reset network never driven with concrete type";
+    for (ResetSignal signal : net)
+      diag.attachNote(signal.field.getLoc()) << "here: ";
     return failure();
   }
 
@@ -1144,7 +1145,7 @@ static FIRRTLBaseType updateType(FIRRTLBaseType oldType, unsigned fieldID,
                                                   bundleType.end());
     fields[index].type = updateType(
         fields[index].type, fieldID - getFieldID(bundleType, index), fieldType);
-    return BundleType::get(fields, oldType.getContext());
+    return BundleType::get(oldType.getContext(), fields);
   }
 
   // If this is a vector type, update the element type.
@@ -1182,11 +1183,13 @@ bool InferResetsPass::updateReset(FieldRef field, FIRRTLBaseType resetType) {
 LogicalResult InferResetsPass::collectAnnos(CircuitOp circuit) {
   LLVM_DEBUG(
       llvm::dbgs() << "\n===----- Gather async reset annotations -----===\n\n");
-  circuit.walk<WalkOrder::PreOrder>([&](FModuleOp module) {
+  auto result = circuit.walk<WalkOrder::PreOrder>([&](FModuleOp module) {
     if (failed(collectAnnos(module)))
       return WalkResult::interrupt();
     return WalkResult::skip();
   });
+  if (result == WalkResult::interrupt())
+    return failure();
   return success();
 }
 
@@ -1687,7 +1690,7 @@ void InferResetsPass::implementAsyncReset(Operation *op, FModuleOp module,
       instOp->erase();
       instOp = newInstOp;
     } else if (domain.existingPort.has_value()) {
-      auto idx = domain.existingPort.value();
+      auto idx = *domain.existingPort;
       instReset = instOp.getResult(idx);
       LLVM_DEBUG(llvm::dbgs() << "  - Using result #" << idx << " as reset\n");
     }
@@ -1759,12 +1762,14 @@ LogicalResult InferResetsPass::verifyNoAbstractReset() {
   for (FModuleLike module :
        getOperation().getBodyBlock()->getOps<FModuleLike>()) {
     for (PortInfo port : module.getPorts()) {
-      if (auto portType = port.type.dyn_cast<FIRRTLType>()) {
-        if (getBaseType(portType).isa<ResetType>()) {
-          module->emitOpError() << "has an abstract reset type port \""
-                                << port.getName() << "\" after InferResets";
-          hasAbstractResetPorts = true;
-        }
+      if (getBaseOfType<ResetType>(port.type)) {
+        auto diag = emitError(port.loc)
+                    << "a port \"" << port.getName()
+                    << "\" with abstract reset type was unable to be "
+                       "inferred by InferResets (is this a top-level port?)";
+        diag.attachNote(module->getLoc())
+            << "the module with this uninferred reset port was defined here";
+        hasAbstractResetPorts = true;
       }
     }
   }

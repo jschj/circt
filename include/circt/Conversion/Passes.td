@@ -264,6 +264,76 @@ def MaterializeCalyxToFSM : Pass<"materialize-calyx-to-fsm", "calyx::ComponentOp
 }
 
 
+def CalyxRemoveGroupsFromFSM : Pass<"calyx-remove-groups-fsm", "calyx::ComponentOp"> {
+  let summary = "Perform FSM outlining and group removal";
+  let description = [{
+    This pass will outline the FSM into module scope and replace any SSA value references
+    from within the FSM body with additional inputs. Given this, the FSM
+    is instantiated as a `fsm.hw_module` operation within the Calyx component.
+    Using the FSM I/O (which is the group go/done signals), the `calyx.group`
+    operations are removed from the component, with the group go and done signals
+    being wired up to the FSM instance.
+    Example:
+    ```mlir
+    calyx.component {
+        %reg, ... = calyx.register ... : i1
+        calyx.wires {
+            // Groups have explicit done signals, and assignments are not guarded
+            // by a group go signal.
+            calyx.group @A {
+                ...
+                calyx.assign %reg = ...
+                ...
+                calyx.group_done %foo ? %bar
+            }
+        }
+        calyx.control {
+            // Machine is defined inside the `calyx.control` operation and references
+            // SSA values defined outside the machine.
+            fsm.machine @control(%A_done : i1) -> (%A_go : i1) {
+                ...
+                %0 = comb.not %reg // reference some SSA value defined outside the machine
+                ...
+            }
+        }
+    }
+    ```
+
+    into
+    ```mlir
+    // The machine has been outlined into module scope, and no longer references
+    // any SSA values defined outside the machine. It is now fully independent
+    // from any notion of Calyx.
+    fsm.machine @control(%A_done : i1, %reg : i1) -> (%A_go : i1) {
+        ...
+        %0 = comb.not %reg // reference some SSA value defined outside the machine
+        ...
+    }
+
+    calyx.component {
+        %reg, ... = calyx.register ...
+        // Done signals are now wires
+        %A_done_in, %A_done_out = calyx.wire : i1
+        // The FSM is now instantiated as an `fsm.hwinstance` module
+        %A_go = fsm.hwinstance @control(%A_done_out, %reg) : ...
+        calyx.wires {
+            // Groups have been inlined, the group go signal is now a guard for
+            // all assignments, and `calyx.group_done` operations have been
+            // replaced by wire assignments.
+            ...
+            calyx.assign %reg = %A_go ? ...
+            ...
+            calyx.assign %A_done_in = %foo ? %bar
+        }
+        calyx.control {
+        }
+    }
+    ```
+  }];
+  let dependentDialects = ["fsm::FSMDialect", "comb::CombDialect", "hw::HWDialect"];
+  let constructor = "circt::createRemoveGroupsFromFSMPass()";
+}
+
 //===----------------------------------------------------------------------===//
 // FSMToSV
 //===----------------------------------------------------------------------===//
@@ -297,8 +367,8 @@ def LowerFIRRTLToHW : Pass<"lower-firrtl-to-hw", "mlir::ModuleOp"> {
     "Emit warnings on unprocessed annotations during lower-to-hw pass">,
     Option<"emitChiselAssertsAsSVA", "emit-chisel-asserts-as-sva",
            "bool", "false","Convert all Chisel asserts to SVA">,
-    Option<"stripMuxPragmas", "strip-mux-pragmas", "bool", "false",
-            "Do not annotate mux pragmas to multibit mux and subacess results">
+    Option<"addMuxPragmas", "add-mux-pragmas", "bool", "false",
+            "Annotate mux pragmas to multibit mux and subacess results">
   ];
 }
 
@@ -355,7 +425,7 @@ def ConvertMooreToCore : Pass<"convert-moore-to-core", "mlir::ModuleOp"> {
 def ConvertLLHDToLLVM : Pass<"convert-llhd-to-llvm", "mlir::ModuleOp"> {
   let summary = "Convert LLHD to LLVM";
   let description = [{
-    This pass translates LLHD to LLVM."
+    This pass translates LLHD to LLVM.
   }];
   let constructor = "circt::createConvertLLHDToLLVMPass()";
   let dependentDialects = ["mlir::LLVM::LLVMDialect"];
@@ -368,7 +438,7 @@ def ConvertLLHDToLLVM : Pass<"convert-llhd-to-llvm", "mlir::ModuleOp"> {
 def ConvertHWToLLVM : Pass<"convert-hw-to-llvm", "mlir::ModuleOp"> {
   let summary = "Convert HW to LLVM";
   let description = [{
-    This pass translates HW to LLVM."
+    This pass translates HW to LLVM.
   }];
   let constructor = "circt::createConvertHWToLLVMPass()";
   let dependentDialects = ["mlir::LLVM::LLVMDialect"];
@@ -381,7 +451,7 @@ def ConvertHWToLLVM : Pass<"convert-hw-to-llvm", "mlir::ModuleOp"> {
 def ConvertCombToLLVM : Pass<"convert-comb-to-llvm", "mlir::ModuleOp"> {
   let summary = "Convert Comb to LLVM";
   let description = [{
-    This pass translates Comb to LLVM."
+    This pass translates Comb to LLVM.
   }];
   let constructor = "circt::createConvertCombToLLVMPass()";
   let dependentDialects = ["mlir::LLVM::LLVMDialect"];
@@ -466,6 +536,59 @@ def InsertMergeBlocks : Pass<"insert-merge-blocks", "::mlir::ModuleOp"> {
   }];
   let constructor = "circt::createInsertMergeBlocksPass()";
   let dependentDialects = ["mlir::cf::ControlFlowDialect", "mlir::func::FuncDialect"];
+}
+
+def MaximizeSSA : Pass<"maximize-ssa", "::mlir::ModuleOp"> {
+  let summary = "Convert every function in the module into maximal SSA form";
+  let description = [{
+    Convert the region within every function into maximal SSA form. This
+    ensures that every value used within a block is also defined within the
+    block, making dataflow explicit and removing block dominance-based dataflow
+    semantics. The pass achieves this by adding block arguments wherever
+    necessary to forward values to the block(s) where they are used.
+  }];
+  let constructor = "circt::createMaximizeSSAPass()";
+}
+
+//===----------------------------------------------------------------------===//
+// ConvertToArcs
+//===----------------------------------------------------------------------===//
+
+def ConvertToArcs : Pass<"convert-to-arcs", "mlir::ModuleOp"> {
+  let summary = "Outline logic between registers into state transfer arcs";
+  let description = [{
+    This pass outlines combinational logic between registers into state transfer
+    arc definitions. The the original combinational logic and register is
+    replaced with an arc invocation, where the register is now represented as a
+    latency.
+  }];
+  let constructor = "circt::createConvertToArcsPass()";
+  let dependentDialects = ["circt::arc::ArcDialect"];
+}
+
+//===----------------------------------------------------------------------===//
+// ConvertCombToArith
+//===----------------------------------------------------------------------===//
+
+def ConvertCombToArith : Pass<"convert-comb-to-arith", "mlir::ModuleOp"> {
+  let summary = "Convert combinational ops and constants into arith ops";
+  let constructor = "circt::createConvertCombToArithPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect"];
+}
+
+//===----------------------------------------------------------------------===//
+// ConvertArcToLLVM
+//===----------------------------------------------------------------------===//
+
+def LowerArcToLLVM : Pass<"lower-arc-to-llvm", "mlir::ModuleOp"> {
+  let summary = "Lower state transfer arc representation to LLVM";
+  let constructor = "circt::createLowerArcToLLVMPass()";
+  let dependentDialects = [
+    "arc::ArcDialect",
+    "mlir::LLVM::LLVMDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::func::FuncDialect"
+  ];
 }
 
 #endif // CIRCT_CONVERSION_PASSES_TD

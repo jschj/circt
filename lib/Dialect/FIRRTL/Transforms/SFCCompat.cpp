@@ -81,15 +81,14 @@ void SFCCompatPass::runOnOperation() {
               if (src.isa<ConstantOp, InvalidValueOp, SpecialConstantOp>())
                 return true;
               auto diag = emitError(reg.getLoc());
-              bool rootKnown;
-              auto fieldName = getFieldName(dst, rootKnown);
+              auto [fieldName, rootKnown] = getFieldName(dst);
               diag << "register " << reg.getNameAttr()
                    << " has an async reset, but its reset value";
               if (rootKnown)
                 diag << " \"" << fieldName << "\"";
               diag << " is not driven with a constant value through wires, "
                       "nodes, or connects";
-              fieldName = getFieldName(src, rootKnown);
+              std::tie(fieldName, rootKnown) = getFieldName(src);
               diag.attachNote(src.getLoc())
                   << "reset driver is "
                   << (rootKnown ? ("\"" + fieldName + "\"") : "here");
@@ -104,6 +103,7 @@ void SFCCompatPass::runOnOperation() {
     // Delete invalids which have no uses.
     if (inv->getUses().empty()) {
       inv->erase();
+      madeModifications = true;
       continue;
     }
     ImplicitLocOpBuilder builder(inv.getLoc(), inv);

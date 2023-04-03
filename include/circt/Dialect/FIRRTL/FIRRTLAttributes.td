@@ -13,7 +13,7 @@
 #ifndef CIRCT_DIALECT_FIRRTL_FIRRTLATTRIBUTES_TD
 #define CIRCT_DIALECT_FIRRTL_FIRRTLATTRIBUTES_TD
 
-include "mlir/IR/EnumAttr.td"
+include "FIRRTLDialect.td"
 include "mlir/IR/BuiltinAttributeInterfaces.td"
 
 //===----------------------------------------------------------------------===//
@@ -34,24 +34,6 @@ def PortAnnotationsAttr : ArrayAttrBase<
             "::mlir::DictionaryAttr>();})">]>,
     "Port annotations attribute"> {
   let constBuilderCall = "$_builder.getArrayAttr($0)";
-}
-
-def InvalidValueAttr : AttrDef<FIRRTLDialect, "InvalidValue",
-                               [TypedAttrInterface]> {
-  let summary = "A constant value of firrtl.invalid type";
-  let description = [{
-    Represents an firrtl.invalidvalue value, whose type is specified by the
-    type of the attribute.
-  }];
-  let mnemonic = "invalidvalue";
-  let parameters = (ins  AttributeSelfTypeParameter<"">:$type);
-
-  let assemblyFormat = "";
-
-  let builders = [
-    AttrBuilderWithInferredContext<(ins "Type":$type),
-                                   "return $_get(type.getContext(), type);">
-  ];
 }
 
 //===----------------------------------------------------------------------===//
@@ -189,18 +171,22 @@ def ParamDeclAttr : AttrDef<FIRRTLDialect, "ParamDecl", [TypedAttrInterface]> {
 def ParamDeclArrayAttr
   : TypedArrayAttrBase<ParamDeclAttr, "parameter array attribute">;
 
-/// An attribute describing a kind of a name which defines name preservation
-/// semantics. We preserve names tagged with `InterestingName`.
-def DroppableName: I32EnumAttrCase<"DroppableName", 0, "droppable_name">;
-def InterestingName: I32EnumAttrCase<"InterestingName", 1, "interesting_name">;
-
-def NameKindEnumImpl: I32EnumAttr<"NameKindEnum", "name kind",
-              [DroppableName, InterestingName]> {
-  let genSpecializedAttr = 0;
-  let cppNamespace = "::circt::firrtl";
+/// An attribute holding information about memory initialization.
+def MemoryInitAttr : AttrDef<FIRRTLDialect, "MemoryInit"> {
+  let mnemonic = "meminit";
+  let summary = "Information about the initial state of a memory";
+  let description = [{
+    This attribute captures information about the external initialization of a
+    memory.  This is the FIRRTL Dialect representation of both
+    "firrtl.annotations.LoadMemoryFromFile" and
+    "firrtl.annotations.MemoryFileInlineAnnotation".
+  }];
+  let parameters = (
+    ins "::mlir::StringAttr":$filename,
+        "::mlir::BoolAttr":$isBinary,
+        "::mlir::BoolAttr":$isInline
+  );
+ let assemblyFormat = "`<` $filename `,` $isBinary `,` $isInline `>`";
 }
-
-def NameKindAttr: EnumAttr<FIRRTLDialect, NameKindEnumImpl, "name_kind">;
-
 
 #endif // CIRCT_DIALECT_FIRRTL_FIRRTLATTRIBUTES_TD

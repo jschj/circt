@@ -41,18 +41,35 @@ struct SeqFIRRTLToSVPass
   using LowerSeqFIRRTLToSVBase<
       SeqFIRRTLToSVPass>::addVivadoRAMAddressConflictSynthesisBugWorkaround;
   using LowerSeqFIRRTLToSVBase<SeqFIRRTLToSVPass>::LowerSeqFIRRTLToSVBase;
+  using LowerSeqFIRRTLToSVBase<SeqFIRRTLToSVPass>::numSubaccessRestored;
 };
 } // anonymous namespace
+
+/// Create the assign.
+static void createAssign(ConversionPatternRewriter &rewriter, sv::RegOp svReg,
+                         CompRegOp reg) {
+  rewriter.create<sv::PAssignOp>(reg.getLoc(), svReg, reg.getInput());
+}
+/// Create the assign inside of an if block.
+static void createAssign(ConversionPatternRewriter &rewriter, sv::RegOp svReg,
+                         CompRegClockEnabledOp reg) {
+  Location loc = reg.getLoc();
+  rewriter.create<sv::IfOp>(loc, reg.getClockEnable(), [&]() {
+    rewriter.create<sv::PAssignOp>(reg.getLoc(), svReg, reg.getInput());
+  });
+}
 
 namespace {
 /// Lower CompRegOp to `sv.reg` and `sv.alwaysff`. Use a posedge clock and
 /// synchronous reset.
-struct CompRegLower : public OpConversionPattern<CompRegOp> {
+template <typename OpTy>
+struct CompRegLower : public OpConversionPattern<OpTy> {
 public:
-  using OpConversionPattern::OpConversionPattern;
+  using OpConversionPattern<OpTy>::OpConversionPattern;
+  using OpAdaptor = typename OpConversionPattern<OpTy>::OpAdaptor;
 
   LogicalResult
-  matchAndRewrite(CompRegOp reg, OpAdaptor adaptor,
+  matchAndRewrite(OpTy reg, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
     Location loc = reg.getLoc();
 
@@ -65,23 +82,21 @@ public:
     if (reg.getSymName().has_value())
       svReg.setInnerSymAttr(reg.getSymNameAttr());
 
-    if (auto attribute = circt::sv::getSVAttributes(reg))
-      circt::sv::setSVAttributes(svReg, attribute);
+    circt::sv::setSVAttributes(svReg, circt::sv::getSVAttributes(reg));
 
     auto regVal = rewriter.create<sv::ReadInOutOp>(loc, svReg);
     if (reg.getReset() && reg.getResetValue()) {
       rewriter.create<sv::AlwaysFFOp>(
           loc, sv::EventControl::AtPosEdge, reg.getClk(), ResetType::SyncReset,
           sv::EventControl::AtPosEdge, reg.getReset(),
-          [&]() { rewriter.create<sv::PAssignOp>(loc, svReg, reg.getInput()); },
+          [&]() { createAssign(rewriter, svReg, reg); },
           [&]() {
             rewriter.create<sv::PAssignOp>(loc, svReg, reg.getResetValue());
           });
     } else {
       rewriter.create<sv::AlwaysFFOp>(
-          loc, sv::EventControl::AtPosEdge, reg.getClk(), [&]() {
-            rewriter.create<sv::PAssignOp>(loc, svReg, reg.getInput());
-          });
+          loc, sv::EventControl::AtPosEdge, reg.getClk(),
+          [&]() { createAssign(rewriter, svReg, reg); });
     }
 
     rewriter.replaceOp(reg, {regVal});
@@ -102,6 +117,8 @@ public:
 
   void lower();
 
+  unsigned numSubaccessRestored = 0;
+
 private:
   struct RegLowerInfo {
     sv::RegOp reg;
@@ -114,8 +131,13 @@ private:
   RegLowerInfo lower(FirRegOp reg);
 
   void initialize(OpBuilder &builder, RegLowerInfo reg, ArrayRef<Value> rands);
+  void initializeRegisterElements(Location loc, OpBuilder &builder, Value reg,
+                                  Value rand, unsigned &pos);
 
   void createTree(OpBuilder &builder, Value reg, Value term, Value next);
+  std::optional<std::tuple<Value, Value, Value>>
+  tryRestoringSubaccess(OpBuilder &builder, Value reg, Value term,
+                        hw::ArrayCreateOp nextArray);
 
   void addToAlwaysBlock(Block *block, sv::EventControl clockEdge, Value clock,
                         std::function<void(OpBuilder &)> body,
@@ -195,11 +217,17 @@ void FirRegLower::lower() {
   for (auto reg : toInit)
     if (reg.randStart >= 0)
       maxBit = std::max(maxBit, (uint64_t)reg.randStart + reg.width);
-  for (auto &reg : toInit)
+
+  // This is a map from async reset signals to register info.
+  llvm::MapVector<Value, SmallVector<RegLowerInfo>> asyncResets;
+  for (auto &reg : toInit) {
     if (reg.randStart == -1) {
       reg.randStart = maxBit;
       maxBit += reg.width;
     }
+    if (reg.asyncResetSignal)
+      asyncResets[reg.asyncResetSignal].emplace_back(reg);
+  }
 
   // Create an initial block at the end of the module where random
   // initialisation will be inserted.  Create two builders into the two
@@ -213,7 +241,7 @@ void FirRegLower::lower() {
   //     `INIT_RANDOM_PROLOG_
   //     ... initBuilder ..
   // `endif
-  if (toInit.empty() || disableRegRandomization)
+  if (toInit.empty() || (disableRegRandomization && asyncResets.empty()))
     return;
 
   auto loc = module.getLoc();
@@ -222,6 +250,7 @@ void FirRegLower::lower() {
 
   auto builder =
       ImplicitLocOpBuilder::atBlockTerminator(loc, module.getBodyBlock());
+
   builder.create<sv::IfDefOp>(
       "SYNTHESIS", [] {},
       [&] {
@@ -231,51 +260,42 @@ void FirRegLower::lower() {
           });
 
           builder.create<sv::InitialOp>([&] {
-            builder.create<sv::IfDefProceduralOp>("INIT_RANDOM_PROLOG_", [&] {
-              builder.create<sv::VerbatimOp>("`INIT_RANDOM_PROLOG_");
-            });
-            llvm::MapVector<Value, SmallVector<RegLowerInfo>> resets;
-            builder.create<sv::IfDefProceduralOp>(randInitRef, [&] {
-              // Create randomization vector
-              SmallVector<Value> randValues;
-              for (uint64_t x = 0; x < (maxBit + 31) / 32; ++x) {
-                auto lhs =
-                    builder.create<sv::LogicOp>(loc, builder.getIntegerType(32),
-                                                "_RANDOM_" + llvm::utostr(x));
-                auto rhs = builder.create<sv::MacroRefExprSEOp>(
-                    loc, builder.getIntegerType(32), "RANDOM");
-                builder.create<sv::BPAssignOp>(loc, lhs, rhs);
-                randValues.push_back(lhs.getResult());
-              }
-
-              // Create initialisers for all registers.
-              for (auto &svReg : toInit) {
-                initialize(builder, svReg, randValues);
-
-                if (svReg.asyncResetSignal)
-                  resets[svReg.asyncResetSignal].emplace_back(svReg);
-              }
-            });
-
-            if (!resets.empty()) {
-              builder.create<sv::IfDefProceduralOp>("RANDOMIZE", [&] {
-                // If the register is async reset, we need to insert extra
-                // initialization in post-randomization so that we can set the
-                // reset value to register if the reset signal is enabled.
-                for (auto &reset : resets) {
-                  // Create a block guarded by the RANDOMIZE macro and the
-                  // reset: `ifdef RANDOMIZE
-                  //   if (reset) begin
-                  //     ..
-                  //   end
-                  // `endif
-                  builder.create<sv::IfOp>(reset.first, [&] {
-                    for (auto &reg : reset.second)
-                      builder.create<sv::BPAssignOp>(reg.reg.getLoc(), reg.reg,
-                                                     reg.asyncResetValue);
-                  });
-                }
+            if (!disableRegRandomization) {
+              builder.create<sv::IfDefProceduralOp>("INIT_RANDOM_PROLOG_", [&] {
+                builder.create<sv::VerbatimOp>("`INIT_RANDOM_PROLOG_");
               });
+              builder.create<sv::IfDefProceduralOp>(randInitRef, [&] {
+                // Create randomization vector
+                SmallVector<Value> randValues;
+                for (uint64_t x = 0; x < (maxBit + 31) / 32; ++x) {
+                  auto lhs = builder.create<sv::LogicOp>(
+                      loc, builder.getIntegerType(32),
+                      "_RANDOM_" + llvm::utostr(x));
+                  auto rhs = builder.create<sv::MacroRefExprSEOp>(
+                      loc, builder.getIntegerType(32), "RANDOM");
+                  builder.create<sv::BPAssignOp>(loc, lhs, rhs);
+                  randValues.push_back(lhs.getResult());
+                }
+
+                // Create initialisers for all registers.
+                for (auto &svReg : toInit)
+                  initialize(builder, svReg, randValues);
+              });
+            }
+            if (!asyncResets.empty()) {
+              // If the register is async reset, we need to insert extra
+              // initialization in post-randomization so that we can set the
+              // reset value to register if the reset signal is enabled.
+              for (auto &reset : asyncResets) {
+                //  if (reset) begin
+                //    ..
+                //  end
+                builder.create<sv::IfOp>(reset.first, [&] {
+                  for (auto &reg : reset.second)
+                    builder.create<sv::BPAssignOp>(reg.reg.getLoc(), reg.reg,
+                                                   reg.asyncResetValue);
+                });
+              }
             }
           });
 
@@ -309,6 +329,105 @@ static bool areEquivalentValues(Value term, Value next) {
   return false;
 }
 
+static llvm::SetVector<Value> extractConditions(Value value) {
+  auto andOp = value.getDefiningOp<comb::AndOp>();
+  // If the value is not AndOp with a bin flag, use it as a condition.
+  if (!andOp || !andOp.getTwoState()) {
+    llvm::SetVector<Value> ret;
+    ret.insert(value);
+    return ret;
+  }
+
+  return llvm::SetVector<Value>(andOp.getOperands().begin(),
+                                andOp.getOperands().end());
+}
+
+static std::optional<APInt> getConstantValue(Value value) {
+  auto constantIndex = value.template getDefiningOp<hw::ConstantOp>();
+  if (constantIndex)
+    return constantIndex.getValue();
+  return {};
+}
+
+// Return a tuple <cond, idx, val> if the array register update can be
+// represented with a dynamic index assignment:
+// if (cond)
+//   reg[idx] <= val;
+//
+std::optional<std::tuple<Value, Value, Value>>
+FirRegLower::tryRestoringSubaccess(OpBuilder &builder, Value reg, Value term,
+                                   hw::ArrayCreateOp nextRegValue) {
+  Value trueVal;
+  SmallVector<Value> muxConditions;
+  // Compat fix for GCC12's libstdc++, cannot use
+  // llvm::enumerate(llvm::reverse(OperandRange)).  See #4900.
+  SmallVector<Value> reverseOpValues(llvm::reverse(nextRegValue.getOperands()));
+  if (!llvm::all_of(llvm::enumerate(reverseOpValues), [&](auto idxAndValue) {
+        // Check that `nextRegValue[i]` is `cond_i ? val : reg[i]`.
+        auto [i, value] = idxAndValue;
+        auto mux = value.template getDefiningOp<comb::MuxOp>();
+        // Ensure that mux has binary flag.
+        if (!mux || !mux.getTwoState())
+          return false;
+        // The next value must be same.
+        if (trueVal && trueVal != mux.getTrueValue())
+          return false;
+        if (!trueVal)
+          trueVal = mux.getTrueValue();
+        muxConditions.push_back(mux.getCond());
+        // Check that ith element is an element of the register we are
+        // currently lowering.
+        auto arrayGet =
+            mux.getFalseValue().template getDefiningOp<hw::ArrayGetOp>();
+        if (!arrayGet)
+          return false;
+        return areEquivalentValues(arrayGet.getInput(), term) &&
+               getConstantValue(arrayGet.getIndex()) == i;
+      }))
+    return {};
+
+  // Extract common expressions among mux conditions.
+  llvm::SetVector<Value> commonConditions =
+      extractConditions(muxConditions.front());
+  for (auto condition : ArrayRef(muxConditions).drop_front()) {
+    auto cond = extractConditions(condition);
+    commonConditions.remove_if([&](auto v) { return !cond.contains(v); });
+  }
+  Value indexValue;
+  for (auto [idx, condition] : llvm::enumerate(muxConditions)) {
+    llvm::SetVector<Value> extractedConditions = extractConditions(condition);
+    // Remove common conditions and check the remaining condition is only an
+    // index comparision.
+    extractedConditions.remove_if(
+        [&](auto v) { return commonConditions.contains(v); });
+    if (extractedConditions.size() != 1)
+      return {};
+
+    auto indexCompare =
+        (*extractedConditions.begin()).getDefiningOp<comb::ICmpOp>();
+    if (!indexCompare || !indexCompare.getTwoState() ||
+        indexCompare.getPredicate() != comb::ICmpPredicate::eq)
+      return {};
+    // `IndexValue` must be same.
+    if (indexValue && indexValue != indexCompare.getLhs())
+      return {};
+    if (!indexValue)
+      indexValue = indexCompare.getLhs();
+    if (getConstantValue(indexCompare.getRhs()) != idx)
+      return {};
+  }
+
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointAfterValue(reg);
+  Value commonConditionValue;
+  if (commonConditions.empty())
+    commonConditionValue = getOrCreateConstant(reg.getLoc(), APInt(1, 1));
+  else
+    commonConditionValue = builder.createOrFold<comb::AndOp>(
+        reg.getLoc(), builder.getI1Type(), commonConditions.takeVector(), true);
+  return std::make_tuple(commonConditionValue, indexValue, trueVal);
+}
+
 void FirRegLower::createTree(OpBuilder &builder, Value reg, Value term,
                              Value next) {
   // If term and next values are equivalent, we don't have to create an
@@ -325,8 +444,29 @@ void FirRegLower::createTree(OpBuilder &builder, Value reg, Value term,
     // If the next value is an array creation, split the value into
     // invidial elements and construct trees recursively.
     if (auto array = next.getDefiningOp<hw::ArrayCreateOp>()) {
-      for (auto [idx, value] :
-           llvm::enumerate(llvm::reverse(array.getOperands()))) {
+      // First, try restoring subaccess assignments.
+      if (auto matchResultOpt =
+              tryRestoringSubaccess(builder, reg, term, array)) {
+        Value cond, index, trueValue;
+        std::tie(cond, index, trueValue) = *matchResultOpt;
+        addToIfBlock(
+            builder, cond,
+            [&]() {
+              auto nextReg = builder.create<sv::ArrayIndexInOutOp>(reg.getLoc(),
+                                                                   reg, index);
+              auto termElement =
+                  builder.create<hw::ArrayGetOp>(term.getLoc(), term, index);
+              createTree(builder, nextReg, termElement, trueValue);
+              termElement.erase();
+            },
+            []() {});
+        ++numSubaccessRestored;
+        return;
+      }
+      // Compat fix for GCC12's libstdc++, cannot use
+      // llvm::enumerate(llvm::reverse(OperandRange)).  See #4900.
+      SmallVector<Value> reverseOpValues(llvm::reverse(array.getOperands()));
+      for (auto [idx, value] : llvm::enumerate(reverseOpValues)) {
 
         // Create an index constant.
         auto idxVal = getOrCreateConstant(
@@ -380,9 +520,9 @@ FirRegLower::RegLowerInfo FirRegLower::lower(FirRegOp reg) {
   if (addVivadoRAMAddressConflictSynthesisBugWorkaround &&
       hw::type_isa<hw::ArrayType, hw::UnpackedArrayType>(reg.getType()))
     circt::sv::setSVAttributes(
-        svReg.reg, sv::SVAttributesAttr::get(
-                       builder.getContext(),
-                       {std::make_pair("ram_style", R"("distributed")")}));
+        svReg.reg,
+        sv::SVAttributeAttr::get(builder.getContext(), "ram_style",
+                                 R"("distributed")", /*emitAsComment=*/false));
 
   if (auto innerSymAttr = reg.getInnerSymAttr())
     svReg.reg.setInnerSymAttr(innerSymAttr);
@@ -421,6 +561,37 @@ FirRegLower::RegLowerInfo FirRegLower::lower(FirRegOp reg) {
   return svReg;
 }
 
+// Initialize registers by assigning each element recursively instead of
+// initializing entire registers. This is necessary as a workaround for
+// verilator which allocates many local variables for concat op.
+void FirRegLower::initializeRegisterElements(Location loc, OpBuilder &builder,
+                                             Value reg, Value randomSource,
+                                             unsigned &pos) {
+  auto type = reg.getType().cast<sv::InOutType>().getElementType();
+  if (auto intTy = hw::type_dyn_cast<IntegerType>(type)) {
+    // Use randomSource[pos-1:pos-width] as a random value.
+    pos -= intTy.getWidth();
+    auto elem = builder.createOrFold<comb::ExtractOp>(loc, randomSource, pos,
+                                                      intTy.getWidth());
+    builder.create<sv::BPAssignOp>(loc, reg, elem);
+  } else if (auto array = hw::type_dyn_cast<hw::ArrayType>(type)) {
+    for (unsigned i = 0, e = array.getSize(); i < e; ++i) {
+      auto index = getOrCreateConstant(loc, APInt(llvm::Log2_64_Ceil(e), i));
+      initializeRegisterElements(
+          loc, builder, builder.create<sv::ArrayIndexInOutOp>(loc, reg, index),
+          randomSource, pos);
+    }
+  } else if (auto structType = hw::type_dyn_cast<hw::StructType>(type)) {
+    for (auto e : structType.getElements())
+      initializeRegisterElements(
+          loc, builder,
+          builder.create<sv::StructFieldInOutOp>(loc, reg, e.name),
+          randomSource, pos);
+  } else {
+    assert(false && "unsupported type");
+  }
+}
+
 void FirRegLower::initialize(OpBuilder &builder, RegLowerInfo reg,
                              ArrayRef<Value> rands) {
   auto loc = reg.reg.getLoc();
@@ -442,9 +613,9 @@ void FirRegLower::initialize(OpBuilder &builder, RegLowerInfo reg,
     width -= nwidth;
   }
   auto concat = builder.createOrFold<comb::ConcatOp>(loc, nibbles);
-  auto bitcast = builder.createOrFold<hw::BitcastOp>(
-      loc, reg.reg.getElementType(), concat);
-  builder.create<sv::BPAssignOp>(loc, reg.reg, bitcast);
+  unsigned pos = reg.width;
+  // Initialize register elements.
+  initializeRegisterElements(loc, builder, reg.reg, concat, pos);
 }
 
 void FirRegLower::addToAlwaysBlock(Block *block, sv::EventControl clockEdge,
@@ -525,7 +696,8 @@ void SeqToSVPass::runOnOperation() {
   target.addIllegalDialect<SeqDialect>();
   target.addLegalDialect<sv::SVDialect>();
   RewritePatternSet patterns(&ctxt);
-  patterns.add<CompRegLower>(&ctxt);
+  patterns.add<CompRegLower<CompRegOp>>(&ctxt);
+  patterns.add<CompRegLower<CompRegClockEnabledOp>>(&ctxt);
 
   if (failed(applyPartialConversion(top, target, std::move(patterns))))
     signalPassFailure();
@@ -533,9 +705,10 @@ void SeqToSVPass::runOnOperation() {
 
 void SeqFIRRTLToSVPass::runOnOperation() {
   hw::HWModuleOp module = getOperation();
-  FirRegLower(module, disableRegRandomization,
-              addVivadoRAMAddressConflictSynthesisBugWorkaround)
-      .lower();
+  FirRegLower firRegLower(module, disableRegRandomization,
+                          addVivadoRAMAddressConflictSynthesisBugWorkaround);
+  firRegLower.lower();
+  numSubaccessRestored += firRegLower.numSubaccessRestored;
 }
 
 std::unique_ptr<Pass> circt::seq::createSeqLowerToSVPass() {

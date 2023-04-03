@@ -43,12 +43,13 @@ public:
             // Unary operators.
             AsSIntPrimOp, AsUIntPrimOp, AsAsyncResetPrimOp, AsClockPrimOp,
             CvtPrimOp, NegPrimOp, NotPrimOp, AndRPrimOp, OrRPrimOp, XorRPrimOp,
-            // Verif Expressions.
-            IsXVerifOp,
+            // Intrinsic Expressions.
+            IsXIntrinsicOp, PlusArgsValueIntrinsicOp, PlusArgsTestIntrinsicOp,
+            SizeOfIntrinsicOp,
             // Miscellaneous.
             BitsPrimOp, HeadPrimOp, MuxPrimOp, PadPrimOp, ShlPrimOp, ShrPrimOp,
             TailPrimOp, VerbatimExprOp, HWStructCastOp, BitCastOp, RefSendOp,
-            RefResolveOp, mlir::UnrealizedConversionCastOp>(
+            RefResolveOp, RefSubOp, mlir::UnrealizedConversionCastOp>(
             [&](auto expr) -> ResultType {
               return thisCast->visitExpr(expr, args...);
             })
@@ -134,8 +135,11 @@ public:
   HANDLE(OrRPrimOp, Unary);
   HANDLE(XorRPrimOp, Unary);
 
-  // Verif Expr.
-  HANDLE(IsXVerifOp, Unhandled);
+  // Intrinsic Expr.
+  HANDLE(IsXIntrinsicOp, Unhandled);
+  HANDLE(PlusArgsValueIntrinsicOp, Unhandled);
+  HANDLE(PlusArgsTestIntrinsicOp, Unhandled);
+  HANDLE(SizeOfIntrinsicOp, Unhandled);
 
   // Miscellaneous.
   HANDLE(BitsPrimOp, Unhandled);
@@ -149,6 +153,7 @@ public:
   HANDLE(VerbatimExprOp, Unhandled);
   HANDLE(RefSendOp, Unhandled);
   HANDLE(RefResolveOp, Unhandled);
+  HANDLE(RefSubOp, Unhandled);
 
   // Conversions.
   HANDLE(HWStructCastOp, Unhandled);
@@ -165,11 +170,12 @@ public:
   ResultType dispatchStmtVisitor(Operation *op, ExtraArgs... args) {
     auto *thisCast = static_cast<ConcreteType *>(this);
     return TypeSwitch<Operation *, ResultType>(op)
-        .template Case<AttachOp, ConnectOp, StrictConnectOp, ForceOp, PrintFOp,
-                       SkipOp, StopOp, WhenOp, AssertOp, AssumeOp, CoverOp,
-                       ProbeOp>([&](auto opNode) -> ResultType {
-          return thisCast->visitStmt(opNode, args...);
-        })
+        .template Case<AttachOp, ConnectOp, StrictConnectOp, RefDefineOp,
+                       ForceOp, PrintFOp, SkipOp, StopOp, WhenOp, AssertOp,
+                       AssumeOp, CoverOp, ProbeOp>(
+            [&](auto opNode) -> ResultType {
+              return thisCast->visitStmt(opNode, args...);
+            })
         .Default([&](auto expr) -> ResultType {
           return thisCast->visitInvalidStmt(op, args...);
         });
@@ -195,6 +201,7 @@ public:
   HANDLE(AttachOp);
   HANDLE(ConnectOp);
   HANDLE(StrictConnectOp);
+  HANDLE(RefDefineOp);
   HANDLE(ForceOp);
   HANDLE(PrintFOp);
   HANDLE(SkipOp);

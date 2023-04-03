@@ -13,9 +13,10 @@
 #ifndef CIRCT_DIALECT_FIRRTL_PASSES_H
 #define CIRCT_DIALECT_FIRRTL_PASSES_H
 
+#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
-#include "llvm/ADT/Optional.h"
 #include <memory>
+#include <optional>
 
 namespace mlir {
 class Pass;
@@ -26,7 +27,8 @@ namespace firrtl {
 
 std::unique_ptr<mlir::Pass>
 createLowerFIRRTLAnnotationsPass(bool ignoreUnhandledAnnotations = false,
-                                 bool ignoreClasslessAnnotations = false);
+                                 bool ignoreClasslessAnnotations = false,
+                                 bool noRefTypePorts = false);
 
 /// Configure which aggregate values will be preserved by the LowerTypes pass.
 namespace PreserveAggregate {
@@ -48,11 +50,14 @@ enum PreserveMode {
 
 std::unique_ptr<mlir::Pass> createLowerFIRRTLTypesPass(
     PreserveAggregate::PreserveMode mode = PreserveAggregate::None,
+    PreserveAggregate::PreserveMode memoryMode = PreserveAggregate::None,
     bool preservePublicTypes = true);
 
 std::unique_ptr<mlir::Pass> createLowerBundleVectorTypesPass();
 
 std::unique_ptr<mlir::Pass> createLowerCHIRRTLPass();
+
+std::unique_ptr<mlir::Pass> createLowerIntrinsicsPass();
 
 std::unique_ptr<mlir::Pass> createIMConstPropPass();
 
@@ -69,6 +74,8 @@ createCreateSiFiveMetadataPass(bool replSeqMem = false,
                                mlir::StringRef replSeqMemFile = "");
 
 std::unique_ptr<mlir::Pass> createWireDFTPass();
+
+std::unique_ptr<mlir::Pass> createVBToBVPass();
 
 std::unique_ptr<mlir::Pass> createAddSeqMemPortsPass();
 
@@ -92,21 +99,21 @@ createMemToRegOfVecPass(bool replSeqMem = false, bool ignoreReadEnable = false);
 
 std::unique_ptr<mlir::Pass> createPrefixModulesPass();
 
+std::unique_ptr<mlir::Pass> createFIRRTLFieldSourcePass();
+
 std::unique_ptr<mlir::Pass> createPrintInstanceGraphPass();
 
 std::unique_ptr<mlir::Pass> createPrintNLATablePass();
 
 std::unique_ptr<mlir::Pass>
-createBlackBoxReaderPass(llvm::Optional<mlir::StringRef> inputPrefix = {});
-
-std::unique_ptr<mlir::Pass> createGrandCentralPass();
-
-std::unique_ptr<mlir::Pass> createGrandCentralTapsPass();
+createBlackBoxReaderPass(std::optional<mlir::StringRef> inputPrefix = {});
 
 std::unique_ptr<mlir::Pass>
-createGrandCentralSignalMappingsPass(mlir::StringRef outputFilename = "");
+createGrandCentralPass(bool instantiateCompanionOnly = false);
 
 std::unique_ptr<mlir::Pass> createCheckCombCyclesPass();
+
+std::unique_ptr<mlir::Pass> createCheckCombLoopsPass();
 
 std::unique_ptr<mlir::Pass> createSFCCompatPass();
 
@@ -139,10 +146,12 @@ std::unique_ptr<mlir::Pass> createIMDeadCodeElimPass();
 
 std::unique_ptr<mlir::Pass> createRandomizeRegisterInitPass();
 
+std::unique_ptr<mlir::Pass> createRegisterOptimizerPass();
+
 std::unique_ptr<mlir::Pass> createLowerXMRPass();
 
 std::unique_ptr<mlir::Pass>
-createResolveTracesPass(StringRef outputAnnotationFilename = "");
+createResolveTracesPass(mlir::StringRef outputAnnotationFilename = "");
 
 std::unique_ptr<mlir::Pass> createInnerSymbolDCEPass();
 

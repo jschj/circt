@@ -301,9 +301,12 @@ static inline bool isExpressionAlwaysInline(Operation *op) {
   return false;
 }
 
+StringRef getSymOpName(Operation *symOp);
+
 /// Return whether an operation is a constant.
 static inline bool isConstantExpression(Operation *op) {
-  return isa<hw::ConstantOp, sv::ConstantXOp, sv::ConstantZOp>(op);
+  return isa<hw::ConstantOp, sv::ConstantXOp, sv::ConstantZOp,
+             sv::ConstantStrOp>(op);
 }
 
 /// This predicate returns true if the specified operation is considered a
@@ -322,14 +325,16 @@ bool isExpressionEmittedInline(Operation *op, const LoweringOptions &options);
 
 /// For each module we emit, do a prepass over the structure, pre-lowering and
 /// otherwise rewriting operations we don't want to emit.
-void prepareHWModule(Block &block, const LoweringOptions &options);
-void prepareHWModule(hw::HWModuleOp module, const LoweringOptions &options);
+LogicalResult prepareHWModule(Block &block, const LoweringOptions &options);
+LogicalResult prepareHWModule(hw::HWModuleOp module,
+                              const LoweringOptions &options);
 
 void pruneZeroValuedLogic(hw::HWModuleOp module);
 
 /// Rewrite module names and interfaces to not conflict with each other or with
 /// Verilog keywords.
-GlobalNameTable legalizeGlobalNames(ModuleOp topLevel);
+GlobalNameTable legalizeGlobalNames(ModuleOp topLevel,
+                                    const LoweringOptions &options);
 
 } // namespace ExportVerilog
 } // namespace circt

@@ -130,7 +130,7 @@ firrtl.module @TestDshRL(in %in1 : !firrtl.uint<2>, in %in2: !firrtl.uint<3>) {
 // We allow implicit truncation of a register's reset value.
 // CHECK-LABEL: @RegResetTruncation
 firrtl.module @RegResetTruncation(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>, in %value: !firrtl.bundle<a: uint<2>>, out %out: !firrtl.bundle<a: uint<1>>) {
-  %r2 = firrtl.regreset %clock, %reset, %value  : !firrtl.uint<1>, !firrtl.bundle<a: uint<2>>, !firrtl.bundle<a: uint<1>>
+  %r2 = firrtl.regreset %clock, %reset, %value  : !firrtl.clock, !firrtl.uint<1>, !firrtl.bundle<a: uint<2>>, !firrtl.bundle<a: uint<1>>
   firrtl.connect %out, %r2 : !firrtl.bundle<a: uint<1>>, !firrtl.bundle<a: uint<1>>
 }
 
@@ -143,24 +143,9 @@ firrtl.module @TestNodeName(in %in1 : !firrtl.uint<8>) {
   %n2 = firrtl.node %in1 {name = "n1"} : !firrtl.uint<8>
 }
 
-// CHECK-LABEL: @TestInvalidAttr
-firrtl.module @TestInvalidAttr() {
-  // This just shows we can parse and print the InvalidAttr.
-
-  // CHECK: firrtl.constant 42 : !firrtl.uint<8>
-  %x = firrtl.constant 42 : !firrtl.uint<8> {
-    // CHECK-SAME: {test.thing1 = #firrtl.invalidvalue : !firrtl.clock,
-    test.thing1 = #firrtl.invalidvalue : !firrtl.clock,
-    // CHECK-SAME: test.thing2 = #firrtl.invalidvalue : !firrtl.sint<3>,
-    test.thing2 = #firrtl.invalidvalue : !firrtl.sint<3>,
-    // CHECK-SAME: test.thing3 = #firrtl.invalidvalue : !firrtl.uint}
-    test.thing3 = #firrtl.invalidvalue : !firrtl.uint
-  }
-}
-
 // Basic test for NLA operations.
-// CHECK: firrtl.hierpath private @nla [@Parent::@child, @Child]
-firrtl.hierpath private @nla [@Parent::@child, @Child]
+// CHECK: hw.hierpath private @nla [@Parent::@child, @Child]
+hw.hierpath private @nla [@Parent::@child, @Child]
 firrtl.module @Child() {
   %w = firrtl.wire sym @w : !firrtl.uint<1>
 }

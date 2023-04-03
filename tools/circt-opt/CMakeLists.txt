@@ -10,10 +10,14 @@ target_link_libraries(circt-opt
   PRIVATE
   CIRCTAffineToPipeline
   CIRCTAnalysisTestPasses
+  CIRCTArc
+  CIRCTArcToLLVM
+  CIRCTArcTransforms
   CIRCTCalyx
   CIRCTCalyxToHW
   CIRCTCalyxToFSM
   CIRCTCalyxTransforms
+  CIRCTConvertToArcs
   CIRCTESI
   CIRCTExportChiselInterface
   CIRCTExportVerilog
@@ -30,6 +34,7 @@ target_link_libraries(circt-opt
   CIRCTLLHD
   CIRCTLLHDToLLVM
   CIRCTHWToLLVM
+  CIRCTCombToArith
   CIRCTCombToLLVM
   CIRCTLLHDTransforms
   CIRCTMoore
@@ -45,12 +50,12 @@ target_link_libraries(circt-opt
   CIRCTHWTransforms
   CIRCTSCFToCalyx
   CIRCTScheduling
-  CIRCTSchedulingTestPasses
   CIRCTSeq
   CIRCTSeqTransforms
   CIRCTSSP
   CIRCTSSPTransforms
   CIRCTStandardToHandshake
+  CIRCTOM
   CIRCTPipelineOps
   CIRCTPipelineToHW
   CIRCTPipelineTransforms

@@ -1,4 +1,4 @@
-// RUN: circt-opt %s -test-apply-lowering-options='options=exprInEventControl,explicitBitcast,maximumNumberOfTermsPerExpression=10' -export-verilog -verify-diagnostics | FileCheck %s
+// RUN: circt-opt %s -test-apply-lowering-options='options=explicitBitcast,maximumNumberOfTermsPerExpression=10,emitBindComments' -export-verilog -verify-diagnostics | FileCheck %s
 
 // CHECK-LABEL: module M1
 // CHECK-NEXT:    #(parameter [41:0] param1) (
@@ -11,10 +11,10 @@ hw.module @M1<param1: i42>(%clock : i1, %cond : i1, %val : i8) {
 
   %c11_i42 = hw.constant 11: i42
   // CHECK: localparam [41:0]{{ *}} param_x = 42'd11;
-  %param_x = sv.localparam : i42 { value = 11: i42 }
+  %param_x = sv.localparam { value = 11 : i42 } : i42
 
   // CHECK: localparam [41:0]{{ *}} param_y = param1;
-  %param_y = sv.localparam : i42 { value = #hw.param.decl.ref<"param1">: i42 }
+  %param_y = sv.localparam { value = #hw.param.decl.ref<"param1"> : i42 } : i42
 
   // CHECK:        logic{{ *}} [7:0]{{ *}} logic_op = val;
   // CHECK-NEXT: struct packed {logic b; } logic_op_struct;
@@ -22,7 +22,8 @@ hw.module @M1<param1: i42>(%clock : i1, %cond : i1, %val : i8) {
   %logic_op_struct = sv.logic : !hw.inout<struct<b: i1>>
   sv.assign %logic_op, %val: i8
 
-  // CHECK:      always @(posedge clock) begin
+  // CHECK:           (* sv attr *)
+  // CHECK-NEXT:      always @(posedge clock) begin
   sv.always posedge %clock {
     // CHECK: automatic logic [7:0]                     logic_op_procedural = val;
     // CHECK-NEXT: automatic       struct packed {logic b; } logic_op_struct_procedural
@@ -52,7 +53,7 @@ hw.module @M1<param1: i42>(%clock : i1, %cond : i1, %val : i8) {
   // CHECK-NEXT:   `endif
   // CHECK-NEXT: end // always @(posedge)
     }
-  }
+  } {sv.attributes = [#sv.attribute<"sv attr">]}
 
   // CHECK-NEXT: always @(negedge clock) begin
   // CHECK-NEXT: end // always @(negedge)
@@ -103,7 +104,7 @@ hw.module @M1<param1: i42>(%clock : i1, %cond : i1, %val : i8) {
   } ( asyncreset : negedge %cond) {
     sv.fwrite %fd, "Async Reset Block\n"
   }
-
+  // CHECK-NEXT:  (* sv attr *)
   // CHECK-NEXT:  initial begin
   sv.initial {
     // CHECK-NEXT:   if (cond)
@@ -254,7 +255,7 @@ hw.module @M1<param1: i42>(%clock : i1, %cond : i1, %val : i8) {
       sv.fwrite %fd, "M: %x\n"(%text) : i8
 
     }// CHECK-NEXT:   {{end$}}
-  }
+  } {sv.attributes = [#sv.attribute<"sv attr">]}
   // CHECK-NEXT:  end // initial
 
   // CHECK-NEXT: assert property (@(posedge clock) cond);
@@ -457,9 +458,10 @@ hw.module @M1<param1: i42>(%clock : i1, %cond : i1, %val : i8) {
 }
 
 // CHECK-LABEL: module Aliasing(
-// CHECK-NEXT:             inout [41:0] a,
-// CHECK-NEXT:                          b,
-// CHECK-NEXT:                          c)
+// CHECK-NEXT:    inout [41:0] a, //
+// CHECK-NEXT:                 b, //
+// CHECK-NEXT:                 c //
+// CHECK-NEXT:  );
 hw.module @Aliasing(%a : !hw.inout<i42>, %b : !hw.inout<i42>,
                       %c : !hw.inout<i42>) {
 
@@ -471,23 +473,32 @@ hw.module @Aliasing(%a : !hw.inout<i42>, %b : !hw.inout<i42>,
 
 hw.module @reg_0(%in4: i4, %in8: i8) -> (a: i8, b: i8) {
   // CHECK-LABEL: module reg_0(
-  // CHECK-NEXT:   input  [3:0] in4,
-  // CHECK-NEXT:   input  [7:0] in8,
-  // CHECK-NEXT:   output [7:0] a,
-  // CHECK-NEXT:                b);
+  // CHECK-NEXT:   input  [3:0] in4, //
+  // CHECK-NEXT:   input  [7:0] in8, //
+  // CHECK-NEXT:   output [7:0] a, //
+  // CHECK-NEXT:                b //
+  // CHECK-NEXT:  );
 
   // CHECK-EMPTY:
   // CHECK-NEXT: (* dont_merge *)
   // CHECK-NEXT: reg [7:0]       myReg;
-  %myReg = sv.reg {sv.attributes = #sv.attributes<[#sv.attribute<"dont_merge">]>} : !hw.inout<i8>
+  %myReg = sv.reg {sv.attributes = [#sv.attribute<"dont_merge">]} : !hw.inout<i8>
 
   // CHECK-NEXT: (* dont_merge, dont_retime = true *)
+  // CHECK-NEXT: /* comment_merge, comment_retime = true */
+  // CHECK-NEXT: (* another_attr *)
   // CHECK-NEXT: reg [41:0][7:0] myRegArray1;
-  %myRegArray1 = sv.reg {sv.attributes = #sv.attributes<[#sv.attribute<"dont_merge">, #sv.attribute<"dont_retime"="true">]>} : !hw.inout<array<42 x i8>>
+  %myRegArray1 = sv.reg {sv.attributes = [
+    #sv.attribute<"dont_merge">,
+    #sv.attribute<"dont_retime" = "true">,
+    #sv.attribute<"comment_merge", emitAsComment>,
+    #sv.attribute<"comment_retime" = "true", emitAsComment>,
+    #sv.attribute<"another_attr">
+  ]} : !hw.inout<array<42 x i8>>
 
   // CHECK:      /* assign_attr */
   // CHECK-NEXT: assign myReg = in8;
-  sv.assign %myReg, %in8 {sv.attributes = #sv.attributes<[#sv.attribute<"assign_attr">], emitAsComments>} : i8
+  sv.assign %myReg, %in8 {sv.attributes = [#sv.attribute<"assign_attr", emitAsComment>]} : i8
 
   %subscript1 = sv.array_index_inout %myRegArray1[%in4] : !hw.inout<array<42 x i8>>, i4
   sv.assign %subscript1, %in8 : i8   // CHECK-NEXT: assign myRegArray1[in4] = in8;
@@ -526,8 +537,9 @@ hw.module @reg_1(%in4: i4, %in8: i8) -> (a : i3, b : i5) {
 }
 
 // CHECK-LABEL: module struct_field_inout1(
+// CHECK-NEXT:   inout struct packed {logic b; } a
+// CHECK-NEXT:  );
 hw.module @struct_field_inout1(%a : !hw.inout<struct<b: i1>>) {
-  // CHECK: inout struct packed {logic b; } a);
   // CHECK: assign a.b = 1'h1;
   %true = hw.constant true
   %0 = sv.struct_field_inout %a["b"] : !hw.inout<struct<b: i1>>
@@ -535,8 +547,9 @@ hw.module @struct_field_inout1(%a : !hw.inout<struct<b: i1>>) {
 }
 
 // CHECK-LABEL: module struct_field_inout2(
+// CHECK-NEXT:    inout struct packed {struct packed {logic c; } b; } a
+// CHECK-NEXT:  );
 hw.module @struct_field_inout2(%a: !hw.inout<struct<b: !hw.struct<c: i1>>>) {
-  // CHECK: inout struct packed {struct packed {logic c; } b; } a);
   // CHECK: assign a.b.c = 1'h1;
   %true = hw.constant true
   %0 = sv.struct_field_inout %a["b"] : !hw.inout<struct<b: !hw.struct<c: i1>>>
@@ -1160,7 +1173,7 @@ hw.module @verbatim_M1(%clock : i1, %cond : i1, %val : i8) {
   %reg2 = sv.reg sym @verbatim_reg2: !hw.inout<i8>
   // CHECK:      (* dont_merge *)
   // CHECK-NEXT: wire [22:0] wire25
-  %wire25 = sv.wire sym @verbatim_wireSym1 {sv.attributes = #sv.attributes<[#sv.attribute<"dont_merge">]>} : !hw.inout<i23>
+  %wire25 = sv.wire sym @verbatim_wireSym1 {sv.attributes = [#sv.attribute<"dont_merge">]} : !hw.inout<i23>
   %add = comb.add %val, %c42 : i8
   %c42_2 = hw.constant 42 : i8
   %xor = comb.xor %val, %c42_2 : i8
@@ -1321,25 +1334,16 @@ hw.module @XMR_src(%a : i23) -> (aa: i3) {
 // Additionally, test that XMRs use properly legalized Verilog names.  The XMR
 // target is "new" and the root of the reference is "wait_order".
 
-hw.globalRef @ref [
-  #hw.innerNameRef<@wait_order::@bar>,
-  #hw.innerNameRef<@XMRRef_Bar::@new>
-]
-hw.globalRef @ref2 [
-  #hw.innerNameRef<@wait_order::@baz>
-]
+hw.hierpath private @ref [@wait_order::@bar, @XMRRef_Bar::@new]
+hw.hierpath private @ref2 [@wait_order::@baz]
 hw.module @XMRRef_Bar() {
-  %new = sv.wire sym @new {
-    circt.globalRef = [#hw.globalNameRef<@ref>]
-  } : !hw.inout<i2>
+  %new = sv.wire sym @new : !hw.inout<i2>
 }
 hw.module.extern @XMRRef_Baz(%a: i2, %b: i1)
 hw.module.extern @XMRRef_Qux(%a: i2, %b: i1)
 // CHECK-LABEL: module wait_order
 hw.module @wait_order() {
-  hw.instance "bar" sym @bar @XMRRef_Bar() -> () {
-    circt.globalRef = [#hw.globalNameRef<@ref>]
-  }
+  hw.instance "bar" sym @bar @XMRRef_Bar() -> ()
   %xmr = sv.xmr.ref @ref : !hw.inout<i2>
   %xmrRead = sv.read_inout %xmr : !hw.inout<i2>
   %xmr2 = sv.xmr.ref @ref2 ".x.y.z[42]" : !hw.inout<i1>
@@ -1351,8 +1355,7 @@ hw.module @wait_order() {
   // CHECK-NEXT: );
   // CHECK-NEXT: */
   hw.instance "baz" sym @baz @XMRRef_Baz(a: %xmrRead: i2, b: %xmr2Read: i1) -> () {
-    doNotPrint = true,
-    circt.globalRef = [#hw.globalNameRef<@ref2>]
+    doNotPrint = true
   }
   // CHECK-NEXT: XMRRef_Qux qux (
   // CHECK-NEXT:   .a (wait_order_0.bar.new_0),
@@ -1362,6 +1365,32 @@ hw.module @wait_order() {
 }
 
 hw.module.extern @MyExtModule(%in: i8)
+hw.module.extern @ExtModule(%in: i8) -> (out: i8)
+
+// CHECK-LABEL: module InlineBind
+// CHEC:        output wire_0
+hw.module @InlineBind(%a_in: i8) -> (wire: i8){
+  // CHECK:      wire [7:0] _ext1_out;
+  // CHECK-NEXT: wire [7:0] _GEN;
+  // CHECK-NEXT: /* This instance is elsewhere emitted as a bind statement.
+  // CHECK-NEXT:   ExtModule ext1 (
+  // CHECK-NEXT:     .in  (8'(a_in + _GEN)),
+  // CHECK-NEXT:     .out (_ext1_out)
+  // CHECK-NEXT:   );
+  // CHECK-NEXT: */
+  // CHECK-NEXT: /* This instance is elsewhere emitted as a bind statement.
+  // CHECK-NEXT:   ExtModule ext2 (
+  // CHECK-NEXT:     .in  (_ext1_out),
+  // CHECK-NEXT:     .out (wire_0)
+  // CHECK-NEXT:   );
+  // CHECK-NEXT: */
+  %0 = sv.wire : !hw.inout<i8>
+  %1 = sv.read_inout %0: !hw.inout<i8>
+  %2 = comb.add %a_in, %1 : i8
+  %3 = hw.instance "ext1" sym @foo1 @ExtModule(in: %2: i8) -> (out: i8) {doNotPrint=1}
+  %4 = hw.instance "ext2" sym @foo2 @ExtModule(in: %3: i8) -> (out: i8) {doNotPrint=1}
+  hw.output %4: i8
+}
 
 // CHECK-LABEL: module MoveInstances
 hw.module @MoveInstances(%a_in: i8) -> (outc : i8){
@@ -1413,10 +1442,7 @@ hw.module @remoteInstDut(%i: i1, %j: i1, %z: i0) -> () {
   hw.instance "a1" sym @bindInst @extInst(_h: %mywire_rd: i1, _i: %myreg_rd: i1, _j: %j: i1, _k: %0: i1, _z: %z: i0) -> () {doNotPrint=1}
   hw.instance "a2" sym @bindInst2 @extInst(_h: %mywire_rd: i1, _i: %myreg_rd: i1, _j: %j: i1, _k: %0: i1, _z: %z: i0) -> () {doNotPrint=1}
   hw.instance "signed" sym @bindInst3 @extInst2(signed: %mywire_rd1 : i1, _i: %myreg_rd1 : i1, _j: %j: i1, _k: %0: i1, _z: %z: i0) -> () {doNotPrint=1}
-// CHECK: wire _signed__k
-// CHECK-NEXT: wire _a2__k = 1'h1;
-// CHECK-NEXT: wire _a1__k = 1'h1;
-// CHECK-NEXT: wire mywire
+// CHECK:      wire mywire
 // CHECK-NEXT: myreg
 // CHECK-NEXT: wire signed_0
 // CHECK-NEXT: reg  output_0
@@ -1432,9 +1458,12 @@ hw.module @remoteInstDut(%i: i1, %j: i1, %z: i0) -> () {
 // CHECK-LABEL: SimplyNestedElseIf
 // CHECK: if (flag1)
 // CHECK: else if (flag2)
-// CHECK: else if (flag3)
+// CHECK: else if (flag3) begin
+// CHECK-NEXT: (* sv attr *)
+// CHECK-NEXT: if (flag4)
+// CHECK: end
 // CHECK: else
-hw.module @SimplyNestedElseIf(%clock: i1, %flag1 : i1, %flag2: i1, %flag3: i1) {
+hw.module @SimplyNestedElseIf(%clock: i1, %flag1 : i1, %flag2: i1, %flag3: i1, %flag4: i1) {
   %fd = hw.constant 0x80000002 : i32
 
   sv.always posedge %clock {
@@ -1445,6 +1474,9 @@ hw.module @SimplyNestedElseIf(%clock: i1, %flag1 : i1, %flag2: i1, %flag3: i1) {
         sv.fwrite %fd, "B"
       } else {
         sv.if %flag3 {
+          sv.if %flag4 {
+            sv.fwrite %fd, "E"
+          } {sv.attributes = [#sv.attribute<"sv attr">]}
           sv.fwrite %fd, "C"
         } else {
           sv.fwrite %fd, "D"
@@ -1549,9 +1581,10 @@ hw.module @ElseIfLocations(%clock: i1, %flag1 : i1, %flag2: i1, %flag3: i1) {
 }
 
 // CHECK-LABEL: ReuseExistingInOut
-// CHECK: input {{.+}},
-// CHECK:        [[INPUT:[:alnum:]+]],
-// CHECK: output [[OUTPUT:.+]])
+// CHECK: input {{.+}}, //
+// CHECK:        [[INPUT:[:alnum:]+]], //
+// CHECK: output [[OUTPUT:.+]] //
+// CHECK: );
 hw.module @ReuseExistingInOut(%clock: i1, %a: i1) -> (out1: i1) {
   %expr1 = comb.or %a, %a : i1
   %expr2 = comb.and %a, %a : i1
@@ -1689,6 +1722,28 @@ hw.module @ConditionalComments() {
   }                             // CHECK-NEXT: `endif // not def BAR
 }
 
+
+// CHECK-LABEL: module intrinsic
+hw.module @intrinsic(%clk: i1) -> (io1: i1, io2: i1, io3: i1, io4: i5) {
+  // CHECK: wire [4:0] [[tmp:.*]];
+
+  %x_i1 = sv.constantX : i1
+  %0 = comb.icmp bin ceq %clk, %x_i1 : i1
+  // CHECK: assign io1 = clk === 1'bx
+
+  %1 = sv.constantStr "foo"
+  %2 = sv.system "test$plusargs"(%1) : (!sv.string) -> i1
+  // CHECK: assign io2 = $test$plusargs("foo")
+
+  %_pargs = sv.wire  : !hw.inout<i5>
+  %3 = sv.read_inout %_pargs : !hw.inout<i5>
+  %4 = sv.system "value$plusargs"(%1, %_pargs) : (!sv.string, !hw.inout<i5>) -> i1
+  // CHECK: assign io3 = $value$plusargs("foo", [[tmp]])
+  // CHECK: assign io4 = [[tmp]]
+
+  hw.output %0, %2, %4, %3 : i1, i1, i1, i5
+}
+
 hw.module @bindInMod() {
   sv.bind #hw.innerNameRef<@remoteInstDut::@bindInst>
   sv.bind #hw.innerNameRef<@remoteInstDut::@bindInst3>
@@ -1699,14 +1754,14 @@ hw.module @bindInMod() {
 // CHECK-NEXT:   ._h (mywire),
 // CHECK-NEXT:   ._i (myreg),
 // CHECK-NEXT:   ._j (j),
-// CHECK-NEXT:   ._k (_a1__k)
+// CHECK-NEXT:   ._k (1'h1)
 // CHECK-NEXT: //._z (z)
 // CHECK-NEXT: );
 // CHECK-NEXT:  bind remoteInstDut extInst2 signed_1 (
 // CHECK-NEXT:    .signed_0 (signed_0),
 // CHECK-NEXT:    ._i       (output_0),
 // CHECK-NEXT:    ._j       (j),
-// CHECK-NEXT:    ._k       (_signed__k)
+// CHECK-NEXT:    ._k       (1'h1)
 // CHECK: endmodule
 
 sv.bind <@wait_order::@baz>
@@ -1722,7 +1777,7 @@ sv.bind #hw.innerNameRef<@remoteInstDut::@bindInst2>
 // CHECK-NEXT:   ._h (mywire),
 // CHECK-NEXT:   ._i (myreg),
 // CHECK-NEXT:   ._j (j),
-// CHECK-NEXT:   ._k (_a2__k)
+// CHECK-NEXT:   ._k (1'h1)
 // CHECK-NEXT: //._z (z)
 // CHECK-NEXT: );
 
@@ -1737,8 +1792,19 @@ hw.module @NastyPort(%.lots$of.dots: i1) -> (".more.dots": i1) {
 }
 sv.bind #hw.innerNameRef<@NastyPortParent::@foo>
 // CHECK-LABEL: bind NastyPortParent NastyPort foo (
-// CHECK-NEXT:    ._lots24of_dots (_foo__lots24of_dots)
-// CHECK-NEXT:    ._more_dots     (_foo__more_dots)
+// CHECK-NEXT:    ._lots24of_dots (1'h0)
+// CHECK-NEXT:    ._more_dots     (/* unused */)
+// CHECK-NEXT:  );
+
+sv.bind #hw.innerNameRef<@InlineBind::@foo1>
+sv.bind #hw.innerNameRef<@InlineBind::@foo2>
+// CHECK-LABEL: bind InlineBind ExtModule ext1 (
+// CHECK-NEXT:    .in  (8'(a_in + _GEN))
+// CHECK-NEXT:    .out (_ext1_out)
+// CHECK-NEXT:  );
+// CHECK-LABEL: bind InlineBind ExtModule ext2 (
+// CHECK-NEXT:    .in  (_ext1_out)
+// CHECK-NEXT:    .out (wire_0)
 // CHECK-NEXT:  );
 
 // CHECK-LABEL:  hw.module @issue595

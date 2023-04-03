@@ -19,8 +19,8 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWSymCache.h"
 #include "circt/Dialect/SV/SVPasses.h"
-#include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/IRMapping.h"
 
 #include <set>
 
@@ -193,8 +193,15 @@ static void addInstancesToCloneSet(
     // the input set. Add any instance inputs to the input set. Also add the
     // instance to the map of extracted instances by module.
     opsToClone.insert(instance);
-    for (auto operand : instance.getOperands())
+    for (auto operand : instance.getOperands()) {
+      // Don't add values to the input set if they are the result of an op we
+      // are already going to clone.
+      if (operand.getDefiningOp() &&
+          opsToClone.contains(operand.getDefiningOp()))
+        continue;
+
       inputsToAdd.push_back(operand);
+    }
     for (auto result : instance.getResults())
       inputsToRemove.push_back(result);
     extractedInstances[instance.getModuleNameAttr().getAttr()].insert(instance);
@@ -225,25 +232,44 @@ static void addInstancesToCloneSet(
     inputs.insert(v);
 }
 
-static StringRef getNameForPort(Value val, ArrayAttr modulePorts) {
-  if (auto readinout = dyn_cast_or_null<ReadInOutOp>(val.getDefiningOp())) {
-    if (auto wire = dyn_cast<WireOp>(readinout.getInput().getDefiningOp()))
-      return wire.getName();
-    if (auto reg = dyn_cast<RegOp>(readinout.getInput().getDefiningOp()))
-      return reg.getName();
-  } else if (auto bv = val.dyn_cast<BlockArgument>()) {
-    return modulePorts[bv.getArgNumber()].cast<StringAttr>().getValue();
+static StringAttr getNameForPort(Value val, ArrayAttr modulePorts) {
+  if (auto bv = val.dyn_cast<BlockArgument>())
+    return modulePorts[bv.getArgNumber()].cast<StringAttr>();
+
+  if (auto *op = val.getDefiningOp()) {
+    if (auto readinout = dyn_cast<ReadInOutOp>(op)) {
+      if (auto *readOp = readinout.getInput().getDefiningOp()) {
+        if (auto wire = dyn_cast<WireOp>(readOp))
+          return wire.getNameAttr();
+        if (auto reg = dyn_cast<RegOp>(readOp))
+          return reg.getNameAttr();
+      }
+    } else if (auto inst = dyn_cast<hw::InstanceOp>(op)) {
+      for (auto [index, result] : llvm::enumerate(inst.getResults()))
+        if (result == val) {
+          SmallString<64> portName = inst.getInstanceName();
+          portName += ".";
+          auto resultName = inst.getResultName(index);
+          if (resultName && !resultName.getValue().empty())
+            portName += resultName.getValue();
+          else
+            Twine(index).toVector(portName);
+          return StringAttr::get(val.getContext(), portName);
+        }
+    }
   }
-  return "";
+
+  return StringAttr::get(val.getContext(), "");
 }
 
 // Given a set of values, construct a module and bind instance of that module
 // that passes those values through.  Returns the new module and the instance
 // pointing to it.
-static hw::HWModuleOp
-createModuleForCut(hw::HWModuleOp op, SetVector<Value> &inputs,
-                   BlockAndValueMapping &cutMap, StringRef suffix,
-                   Attribute path, Attribute fileName, BindTable &bindTable) {
+static hw::HWModuleOp createModuleForCut(hw::HWModuleOp op,
+                                         SetVector<Value> &inputs,
+                                         IRMapping &cutMap, StringRef suffix,
+                                         Attribute path, Attribute fileName,
+                                         BindTable &bindTable) {
   // Filter duplicates and track duplicate reads of elements so we don't
   // make ports for them
   SmallVector<Value> realInputs;
@@ -269,10 +295,10 @@ createModuleForCut(hw::HWModuleOp op, SetVector<Value> &inputs,
   SmallVector<hw::PortInfo> ports;
   {
     auto srcPorts = op.getArgNames();
-    for (auto &port : llvm::enumerate(realInputs)) {
+    for (auto port : llvm::enumerate(realInputs)) {
       auto name = getNameForPort(port.value(), srcPorts);
-      ports.push_back({b.getStringAttr(name), hw::PortDirection::INPUT,
-                       port.value().getType(), port.index()});
+      ports.push_back({name, hw::PortDirection::INPUT, port.value().getType(),
+                       port.index()});
     }
   }
 
@@ -285,7 +311,7 @@ createModuleForCut(hw::HWModuleOp op, SetVector<Value> &inputs,
   newMod.setCommentAttr(b.getStringAttr("VCS coverage exclude_file"));
 
   // Update the mapping from old values to cloned values
-  for (auto &port : llvm::enumerate(realInputs)) {
+  for (auto port : llvm::enumerate(realInputs)) {
     cutMap.map(port.value(), newMod.getBody().getArgument(port.index()));
     for (auto extra : realReads[port.value()])
       cutMap.map(extra, newMod.getBody().getArgument(port.index()));
@@ -320,7 +346,7 @@ static void setInsertPointToEndOrTerminator(OpBuilder &builder, Block *block) {
 
 // Shallow clone, which we use to not clone the content of blocks, doesn't
 // clone the regions, so create all the blocks we need and update the mapping.
-static void addBlockMapping(BlockAndValueMapping &cutMap, Operation *oldOp,
+static void addBlockMapping(IRMapping &cutMap, Operation *oldOp,
                             Operation *newOp) {
   assert(oldOp->getNumRegions() == newOp->getNumRegions());
   for (size_t i = 0, e = oldOp->getNumRegions(); i != e; ++i) {
@@ -346,7 +372,7 @@ static bool hasOoOArgs(hw::HWModuleOp newMod, Operation *op) {
 
 // Update any operand which was emitted before its defining op was.
 static void updateOoOArgs(SmallVectorImpl<Operation *> &lateBoundOps,
-                          BlockAndValueMapping &cutMap) {
+                          IRMapping &cutMap) {
   for (auto *op : lateBoundOps)
     for (unsigned argidx = 0, e = op->getNumOperands(); argidx < e; ++argidx) {
       Value arg = op->getOperand(argidx);
@@ -358,8 +384,7 @@ static void updateOoOArgs(SmallVectorImpl<Operation *> &lateBoundOps,
 // Do the cloning, which is just a pre-order traversal over the module looking
 // for marked ops.
 static void migrateOps(hw::HWModuleOp oldMod, hw::HWModuleOp newMod,
-                       SetVector<Operation *> &depOps,
-                       BlockAndValueMapping &cutMap,
+                       SetVector<Operation *> &depOps, IRMapping &cutMap,
                        hw::InstanceGraph &instanceGraph) {
   hw::InstanceGraphNode *newModNode = instanceGraph.lookup(newMod);
   SmallVector<Operation *, 16> lateBoundOps;
@@ -433,7 +458,7 @@ static void inlineInputOnly(hw::HWModuleOp oldMod,
     }
 
     // Build a mapping from module block arguments to instance inputs.
-    BlockAndValueMapping mapping;
+    IRMapping mapping;
     assert(inst.getInputs().size() == oldMod.getNumInputs());
     auto inputPorts = oldMod.getBodyBlock()->getArguments();
     for (size_t i = 0, e = inputPorts.size(); i < e; ++i)
@@ -560,7 +585,7 @@ private:
     numOpsErased += opsToErase.size();
 
     // Make a module to contain the clone set, with arguments being the cut
-    BlockAndValueMapping cutMap;
+    IRMapping cutMap;
     auto bmod = createModuleForCut(module, inputs, cutMap, suffix, path,
                                    bindFile, bindTable);
 

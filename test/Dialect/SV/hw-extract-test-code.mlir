@@ -134,6 +134,29 @@ module attributes {firrtl.extract.assert =  #hw.output_file<"dir3/", excludeFrom
 }
 
 // -----
+// Check extracted module ports take name of instance result when needed.
+
+// CHECK-LABEL: @InstResult(
+// CHECK: hw.instance "[[name:.+]]_cover"  sym @{{[^ ]+}} @[[name]]_cover(mem.result_name: %{{[^ ]+}}: i1, mem.1: %{{[^ ]+}}: i1, clock: %clock: i1)
+module attributes {firrtl.extract.assert =  #hw.output_file<"dir3/", excludeFromFileList, includeReplicatedOps>} {
+  hw.module @Mem() -> (result_name: i1, "": i1) {
+    %reg = sv.reg : !hw.inout<i1>
+    %0 = sv.read_inout %reg : !hw.inout<i1>
+    hw.output %0, %0 : i1, i1
+  }
+  // Dummy is needed to prevent the instance itself being extracted
+  hw.module @Dummy(%in1: i1, %in2: i1) -> () {}
+  hw.module @InstResult(%clock: i1) -> () {
+    %0, %1 = hw.instance "mem" @Mem() -> (result_name: i1, "": i1)
+    hw.instance "dummy" sym @keep @Dummy(in1: %0 : i1, in2: %1 : i1) -> ()
+    %2 = comb.and bin %0, %1 : i1
+    sv.always posedge %clock  {
+      sv.cover %2, immediate
+    }
+  }
+}
+
+// -----
 // Check "empty" modules are inlined
 
 // CHECK-NOT: @InputOnly(
@@ -253,6 +276,14 @@ module {
 // CHECK-LABEL: @SymNotExtracted
 // CHECK: hw.instance "foo"
 
+// In NoExtraInput, instance foo should be extracted, and no extra input should be added for %0
+// CHECK-LABEL: @NoExtraInput_cover
+// CHECK: %[[or0:.+]] = comb.or
+// CHECK: hw.instance "foo" @Foo(a: %[[or0]]: i1)
+// CHECK-LABEL: @NoExtraInput
+// CHECK: %[[or1:.+]] = comb.or
+// CHECK-NOT: %[[or1]]
+
 module attributes {
   firrtl.extract.testbench = #hw.output_file<"testbench/", excludeFromFileList, includeReplicatedOps>
 } {
@@ -341,6 +372,15 @@ module attributes {
   hw.module @SymNotExtracted(%clock: i1, %in: i1) {
     %foo.b = hw.instance "foo" sym @foo @Foo(a: %in: i1) -> (b: i1)
     sv.always posedge %clock {
+      sv.cover %foo.b, immediate
+    }
+  }
+
+  hw.module @NoExtraInput(%clock: i1, %in: i1) {
+    %0 = comb.or %in, %in : i1
+    %foo.b = hw.instance "foo" @Foo(a: %0: i1) -> (b: i1)
+    sv.always posedge %clock {
+      sv.cover %0, immediate
       sv.cover %foo.b, immediate
     }
   }

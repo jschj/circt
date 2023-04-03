@@ -18,6 +18,7 @@
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOpInterfaces.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/HW/InnerSymbolTable.h"
 #include "circt/Support/FieldRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/FunctionInterfaces.h"
@@ -98,7 +99,7 @@ inline MemDirAttr &operator|=(MemDirAttr &lhs, MemDirAttr rhs) {
 /// Return the StringAttr for the inner_sym name, if it exists.
 inline StringAttr getInnerSymName(Operation *op) {
   auto s = op->getAttrOfType<hw::InnerSymAttr>(
-      InnerSymbolTable::getInnerSymbolAttrName());
+      hw::InnerSymbolTable::getInnerSymbolAttrName());
   if (s)
     return s.getSymName();
   return StringAttr();
@@ -132,21 +133,21 @@ LogicalResult verifySameOperandsIntTypeKind(Operation *op);
 
 // Type inference adaptor for FIRRTL operations.
 LogicalResult inferReturnTypes(
-    MLIRContext *context, Optional<Location> loc, ValueRange operands,
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attrs, mlir::RegionRange regions,
     SmallVectorImpl<Type> &results,
     llvm::function_ref<FIRRTLType(ValueRange, ArrayRef<NamedAttribute>,
-                                  Optional<Location>)>
+                                  std::optional<Location>)>
         callback);
 
 // Common type inference functions.
 FIRRTLType inferAddSubResult(FIRRTLType lhs, FIRRTLType rhs,
-                             Optional<Location> loc);
+                             std::optional<Location> loc);
 FIRRTLType inferBitwiseResult(FIRRTLType lhs, FIRRTLType rhs,
-                              Optional<Location> loc);
+                              std::optional<Location> loc);
 FIRRTLType inferComparisonResult(FIRRTLType lhs, FIRRTLType rhs,
-                                 Optional<Location> loc);
-FIRRTLType inferReductionResult(FIRRTLType arg, Optional<Location> loc);
+                                 std::optional<Location> loc);
+FIRRTLType inferReductionResult(FIRRTLType arg, std::optional<Location> loc);
 
 // Common parsed argument validation functions.
 LogicalResult validateBinaryOpArguments(ValueRange operands,
@@ -187,6 +188,7 @@ struct FirMemory {
   StringAttr modName;
   bool isMasked;
   uint32_t groupID;
+  MemoryInitAttr init;
 
   // Location is carried along but not considered part of the identity of this.
   Location loc;
@@ -197,11 +199,15 @@ struct FirMemory {
   Operation *op = nullptr;
 
   std::tuple<size_t, size_t, size_t, size_t, size_t, size_t, size_t, size_t,
-             size_t, hw::WUW, SmallVector<int32_t>, uint32_t>
+             size_t, hw::WUW, SmallVector<int32_t>, uint32_t, StringRef, bool,
+             bool>
   getTuple() const {
-    return std::tie(numReadPorts, numWritePorts, numReadWritePorts, dataWidth,
-                    depth, readLatency, writeLatency, maskBits, readUnderWrite,
-                    writeUnderWrite, writeClockIDs, groupID);
+    return std::make_tuple(
+        numReadPorts, numWritePorts, numReadWritePorts, dataWidth, depth,
+        readLatency, writeLatency, maskBits, readUnderWrite, writeUnderWrite,
+        writeClockIDs, groupID, init ? init.getFilename().getValue() : "",
+        init ? init.getIsBinary().getValue() : false,
+        init ? init.getIsInline().getValue() : false);
   }
   bool operator<(const FirMemory &rhs) const {
     return getTuple() < rhs.getTuple();
@@ -210,6 +216,25 @@ struct FirMemory {
     return getTuple() == rhs.getTuple();
   }
   StringAttr getFirMemoryName() const;
+
+  /**
+   * Check whether the memory is a seq mem.
+   *
+   * The following conditions must hold:
+   *   1. read latency and write latency of one.
+   *   2. only one readwrite port or write port.
+   *   3. zero or one read port.
+   *   4. undefined read-under-write behavior.
+   */
+  bool isSeqMem() const {
+    if (readLatency != 1 || writeLatency != 1)
+      return false;
+    if (numWritePorts + numReadWritePorts != 1)
+      return false;
+    if (numReadPorts > 1)
+      return false;
+    return dataWidth > 0;
+  }
 };
 
 // Record of the inner sym name, the module name and the corresponding

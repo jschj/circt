@@ -17,6 +17,7 @@
 #include "circt/Dialect/HW/HWSymCache.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/SV/SVAttributes.h"
+#include "circt/Support/CustomDirectiveImpl.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
@@ -45,8 +46,8 @@ bool sv::is2StateExpression(Value v) {
 /// Return true if the specified operation is an expression.
 bool sv::isExpression(Operation *op) {
   return isa<VerbatimExprOp, VerbatimExprSEOp, GetModportOp,
-             ReadInterfaceSignalOp, ConstantXOp, ConstantZOp, MacroRefExprOp,
-             MacroRefExprSEOp>(op);
+             ReadInterfaceSignalOp, ConstantXOp, ConstantZOp, ConstantStrOp,
+             MacroRefExprOp, MacroRefExprSEOp>(op);
 }
 
 LogicalResult sv::verifyInProceduralRegion(Operation *op) {
@@ -87,68 +88,6 @@ static Operation *lookupSymbolInNested(Operation *symbolTableOp,
       }
     }
   return nullptr;
-}
-
-//===----------------------------------------------------------------------===//
-// ImplicitSSAName Custom Directive
-//===----------------------------------------------------------------------===//
-
-static ParseResult parseImplicitSSAName(OpAsmParser &parser,
-                                        NamedAttrList &resultAttrs) {
-
-  if (parser.parseOptionalAttrDict(resultAttrs))
-    return failure();
-
-  // If the attribute dictionary contains no 'name' attribute, infer it from
-  // the SSA name (if specified).
-  bool hadName = llvm::any_of(resultAttrs, [](NamedAttribute attr) {
-    return attr.getName() == "name";
-  });
-
-  // If there was no name specified, check to see if there was a useful name
-  // specified in the asm file.
-  if (hadName)
-    return success();
-
-  // If there is no explicit name attribute, get it from the SSA result name.
-  // If numeric, just use an empty name.
-  auto resultName = parser.getResultName(0).first;
-  if (!resultName.empty() && isdigit(resultName[0]))
-    resultName = "";
-  auto nameAttr = parser.getBuilder().getStringAttr(resultName);
-  auto *context = parser.getBuilder().getContext();
-  resultAttrs.push_back({StringAttr::get(context, "name"), nameAttr});
-  return success();
-}
-
-static void printImplicitSSAName(OpAsmPrinter &p, Operation *op,
-                                 DictionaryAttr attr) {
-  // Note that we only need to print the "name" attribute if the asmprinter
-  // result name disagrees with it.  This can happen in strange cases, e.g.
-  // when there are conflicts.
-  bool namesDisagree = false;
-
-  SmallString<32> resultNameStr;
-  llvm::raw_svector_ostream tmpStream(resultNameStr);
-  p.printOperand(op->getResult(0), tmpStream);
-  auto expectedName = op->getAttrOfType<StringAttr>("name").getValue();
-  auto actualName = tmpStream.str().drop_front();
-  if (actualName != expectedName) {
-    // Anonymous names are printed as digits, which is fine.
-    if (!expectedName.empty() || !isdigit(actualName[0]))
-      namesDisagree = true;
-  }
-
-  if (namesDisagree)
-    p.printOptionalAttrDict(op->getAttrs(),
-                            {SymbolTable::getSymbolAttrName(),
-                             hw::InnerName::getInnerNameAttrName(),
-                             "svAttributes"});
-  else
-    p.printOptionalAttrDict(op->getAttrs(),
-                            {"name", SymbolTable::getSymbolAttrName(),
-                             hw::InnerName::getInnerNameAttrName(),
-                             "svAttributes"});
 }
 
 //===----------------------------------------------------------------------===//
@@ -458,7 +397,7 @@ LogicalResult IfOp::canonicalize(IfOp op, PatternRewriter &rewriter) {
 
   if (auto constant = op.getCond().getDefiningOp<hw::ConstantOp>()) {
 
-    if (constant.getValue().isAllOnesValue())
+    if (constant.getValue().isAllOnes())
       replaceOpWithRegion(rewriter, op, op.getThenRegion());
     else if (!op.getElseRegion().empty())
       replaceOpWithRegion(rewriter, op, op.getElseRegion());
@@ -515,7 +454,7 @@ AlwaysOp::Condition AlwaysOp::getCondition(size_t idx) {
 }
 
 void AlwaysOp::build(OpBuilder &builder, OperationState &result,
-                     ArrayRef<EventControl> events, ArrayRef<Value> clocks,
+                     ArrayRef<sv::EventControl> events, ArrayRef<Value> clocks,
                      std::function<void()> bodyCtor) {
   assert(events.size() == clocks.size() &&
          "mismatch between event and clock list");
@@ -554,7 +493,7 @@ static ParseResult parseEventList(
   StringRef keyword;
   if (!p.parseOptionalKeyword(&keyword)) {
     while (1) {
-      auto kind = symbolizeEventControl(keyword);
+      auto kind = sv::symbolizeEventControl(keyword);
       if (!kind.has_value())
         return p.emitError(loc, "expected 'posedge', 'negedge', or 'edge'");
       auto eventEnum = static_cast<int32_t>(*kind);
@@ -1513,28 +1452,6 @@ LogicalResult WireOp::canonicalize(WireOp wire, PatternRewriter &rewriter) {
 }
 
 //===----------------------------------------------------------------------===//
-// ReadInOutOp
-//===----------------------------------------------------------------------===//
-
-void ReadInOutOp::build(OpBuilder &builder, OperationState &result,
-                        Value input) {
-  auto resultType = input.getType().cast<InOutType>().getElementType();
-  build(builder, result, resultType, input);
-}
-
-//===----------------------------------------------------------------------===//
-// ArrayIndexInOutOp
-//===----------------------------------------------------------------------===//
-
-void ArrayIndexInOutOp::build(OpBuilder &builder, OperationState &result,
-                              Value input, Value index) {
-  auto resultType = input.getType().cast<InOutType>().getElementType();
-  resultType = getAnyHWArrayElementType(resultType);
-  assert(resultType && "input should have 'inout of an array' type");
-  build(builder, result, InOutType::get(resultType), input, index);
-}
-
-//===----------------------------------------------------------------------===//
 // IndexedPartSelectInOutOp
 //===----------------------------------------------------------------------===//
 
@@ -1550,7 +1467,7 @@ static Type getElementTypeOfWidth(Type type, int32_t width) {
 }
 
 LogicalResult IndexedPartSelectInOutOp::inferReturnTypes(
-    MLIRContext *context, Optional<Location> loc, ValueRange operands,
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attrs, mlir::RegionRange regions,
     SmallVectorImpl<Type> &results) {
   auto width = attrs.get("width");
@@ -1592,7 +1509,7 @@ LogicalResult IndexedPartSelectInOutOp::verify() {
   return success();
 }
 
-OpFoldResult IndexedPartSelectInOutOp::fold(ArrayRef<Attribute> constants) {
+OpFoldResult IndexedPartSelectInOutOp::fold(FoldAdaptor) {
   if (getType() == getInput().getType())
     return getInput();
   return {};
@@ -1603,7 +1520,7 @@ OpFoldResult IndexedPartSelectInOutOp::fold(ArrayRef<Attribute> constants) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult IndexedPartSelectOp::inferReturnTypes(
-    MLIRContext *context, Optional<Location> loc, ValueRange operands,
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attrs, mlir::RegionRange regions,
     SmallVectorImpl<Type> &results) {
   auto width = attrs.get("width");
@@ -1633,7 +1550,7 @@ LogicalResult IndexedPartSelectOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult StructFieldInOutOp::inferReturnTypes(
-    MLIRContext *context, Optional<Location> loc, ValueRange operands,
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attrs, mlir::RegionRange regions,
     SmallVectorImpl<Type> &results) {
   auto field = attrs.get("field");

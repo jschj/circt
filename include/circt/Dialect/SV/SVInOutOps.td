@@ -38,7 +38,8 @@ def WireOp : SVOp<"wire", [NonProceduralOp,
   ];
 
   let assemblyFormat = [{
-    (`sym` $inner_sym^)? custom<ImplicitSSAName>(attr-dict) `:` qualified(type($result))
+    (`sym` $inner_sym^)? `` custom<ImplicitSSAName>($name) attr-dict
+    `:` qualified(type($result))
   }];
   let hasCanonicalizeMethod = true;
 
@@ -68,8 +69,8 @@ def RegOp : SVOp<"reg", [
 
   // We handle the name in a custom way, so we use a customer parser/printer.
   let assemblyFormat = [{
-    (`sym` $inner_sym^)? custom<ImplicitSSAName>(attr-dict)
-     `:` qualified(type($result))
+    (`sym` $inner_sym^)? `` custom<ImplicitSSAName>($name) attr-dict
+    `:` qualified(type($result))
   }];
   let hasCanonicalizeMethod = true;
 
@@ -114,7 +115,7 @@ def XMRRefOp : SVOp<"xmr.ref", []> {
     hierarchical paths cannot be known statically and may change.
   }];
   let arguments = (
-    ins SymbolNameAttr:$ref,
+    ins NameRefAttr:$ref,
         DefaultValuedAttr<StrAttr, "{}">:$stringLeaf
   );
   let results = (outs InOutType:$result);
@@ -130,11 +131,6 @@ def ReadInOutOp
                 " inout port) as the value itself.";
   let arguments = (ins InOutType:$input);
   let results = (outs HWValueType:$result);
-
-  let builders = [
-    OpBuilder<(ins "Value":$input)>
-  ];
-
   let assemblyFormat = "$input attr-dict `:` qualified(type($input))";
 }
 
@@ -156,11 +152,6 @@ def ArrayIndexInOutOp
   let description = "See SV Spec 11.5.2.";
   let arguments = (ins InOutArrayType:$input, HWIntegerType:$index);
   let results = (outs InOutType:$result);
-
-  let builders = [
-    OpBuilder<(ins "Value":$input, "Value":$index)>
-  ];
-
   let assemblyFormat =
     "$input`[`$index`]` attr-dict `:` qualified(type($input)) `,` qualified(type($index))";
 }
@@ -184,7 +175,7 @@ def IndexedPartSelectInOutOp : SVOp<"indexed_part_select_inout",
   let extraClassDeclaration = [{
     /// Infer the return types of this operation.
     static LogicalResult inferReturnTypes(MLIRContext *context,
-                                          Optional<Location> loc,
+                                          std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
                                           mlir::RegionRange regions,
@@ -214,7 +205,7 @@ def StructFieldInOutOp : SVOp<"struct_field_inout",
   let extraClassDeclaration = [{
     /// Infer the return types of this operation.
     static LogicalResult inferReturnTypes(MLIRContext *context,
-                                          Optional<Location> loc,
+                                          std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
                                           mlir::RegionRange regions,
@@ -246,8 +237,8 @@ def LogicOp : SVOp<"logic", [DeclareOpInterfaceMethods<OpAsmOpInterface,
   ];
 
   let assemblyFormat = [{
-    (`sym` $inner_sym^)? custom<ImplicitSSAName>(attr-dict) `:`
-                                                qualified(type($result))
+    (`sym` $inner_sym^)? `` custom<ImplicitSSAName>($name) attr-dict
+    `:` qualified(type($result))
   }];
 
   let extraClassDeclaration = [{

@@ -1026,9 +1026,9 @@ firrtl.circuit "Top" attributes {
     %companion_w1__gen_uint = firrtl.instance companion_w1  @Companion_w1(in _gen_uint: !firrtl.ref<uint<1>>)
     %companion_w2__gen_uint = firrtl.instance companion_w2  @Companion_w2(in _gen_uint: !firrtl.ref<uint<2>>)
     %0 = firrtl.ref.send %a_w1 : !firrtl.uint<1>
-    firrtl.connect %companion_w1__gen_uint, %0 : !firrtl.ref<uint<1>>, !firrtl.ref<uint<1>>
+    firrtl.ref.define %companion_w1__gen_uint, %0 : !firrtl.ref<uint<1>>
     %1 = firrtl.ref.send %a_w2 : !firrtl.uint<2>
-    firrtl.connect %companion_w2__gen_uint, %1 : !firrtl.ref<uint<2>>, !firrtl.ref<uint<2>>
+    firrtl.ref.define %companion_w2__gen_uint, %1 : !firrtl.ref<uint<2>>
   }
   firrtl.module @Top() {
     firrtl.instance dut  @DUT()
@@ -1139,8 +1139,8 @@ firrtl.circuit "Top" attributes {
     }
   ]
 } {
-  firrtl.hierpath private @nla_0 [@Top::@t1, @Dut::@s1]
-  firrtl.hierpath private @nla [@Top::@t1, @Dut::@s1]
+  hw.hierpath private @nla_0 [@Top::@t1, @Dut::@s1]
+  hw.hierpath private @nla [@Top::@t1, @Dut::@s1]
   firrtl.module @Companion() attributes {
     annotations = [
       {
@@ -1194,7 +1194,7 @@ firrtl.circuit "Top" attributes {
           }
         ]
       } : !firrtl.uint<2>
-      // CHECK: sv.interface.instance sym 
+      // CHECK: sv.interface.instance sym
       // CHECK-SAME: !sv.interface<@[[VectorOfBundleView:[a-zA-Z0-9_]+]]>
       // CHECK-NOT: sv.interface.instance
     }
@@ -1206,9 +1206,9 @@ firrtl.circuit "Top" attributes {
   }
 
   // CHECK:      sv.interface @[[VectorOfBundleView]] attributes
-  // CHECK-NOT:    sv.interface @VectorOfBundleView_0 
+  // CHECK-NOT:    sv.interface @VectorOfBundleView_0
   // CHECK:      sv.interface @Bundle2
   // CHECK-NEXT:   sv.interface.signal @foo : i1
   // CHECK-NEXT:   sv.interface.signal @bar : i2
-  // CHECK-NOT:    sv.interface @Bundle2_0 
+  // CHECK-NOT:    sv.interface @Bundle2_0
 }

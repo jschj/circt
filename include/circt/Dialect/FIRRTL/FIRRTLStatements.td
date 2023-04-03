@@ -10,6 +10,15 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_FIRRTL_FIRRTLSTATEMENTS_TD
+#define CIRCT_DIALECT_FIRRTL_FIRRTLSTATEMENTS_TD
+
+include "FIRRTLDialect.td"
+include "FIRRTLEnums.td"
+include "FIRRTLOpInterfaces.td"
+include "FIRRTLTypes.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+
 def AttachOp : FIRRTLOp<"attach"> {
   let summary = "Analog Attach Statement";
 
@@ -18,6 +27,7 @@ def AttachOp : FIRRTLOp<"attach"> {
 
   let assemblyFormat = "$attached attr-dict `:` qualified(type($attached))";
 
+  let hasVerifier = 1;
   let hasCanonicalizeMethod = true;
 }
 
@@ -49,8 +59,8 @@ def StrictConnectOp : FIRRTLOp<"strictconnect", [SameTypeOperands, FConnectLike]
     ```
     }];
 
-  let arguments = (ins SizedBaseOrRefTypeOrForeignType:$dest,
-                       SizedBaseOrRefTypeOrForeignType:$src);
+  let arguments = (ins SizedOrForeignType:$dest,
+                       SizedOrForeignType:$src);
   let results = (outs);
   let hasCanonicalizeMethod = true;
 
@@ -60,6 +70,37 @@ def StrictConnectOp : FIRRTLOp<"strictconnect", [SameTypeOperands, FConnectLike]
     "$dest `,` $src  attr-dict `:` qualified(type($dest))";
 }
 
+def RefDefineOp : FIRRTLOp<"ref.define", [SameTypeOperands, FConnectLike]> {
+  let summary = "FIRRTL Define References";
+  let description = [{
+    Define a target reference to the source reference:
+    ```
+      firrtl.ref.define %dest, %src : ref<t1>
+    ```
+    Used to statically route reference from source to destination
+    through the design, one module at a time.
+
+    Similar to "connect" but cannot have multiple define's to same
+    destination and the define is never conditional even if under
+    a "when".
+
+    Source and destination must resolve statically.
+  }];
+  let arguments = (ins RefType:$dest, RefType:$src);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat =
+    "$dest `,` $src  attr-dict `:` qualified(type($dest))";
+
+  let extraClassDeclaration = [{
+    static ConnectBehaviorKind getConnectBehaviorKind() {
+      return ConnectBehaviorKind::StaticSingleConnect;
+    }
+  }];
+}
+
+
 def PrintFOp : FIRRTLOp<"printf"> {
   let summary = "Formatted Print Statement";
 
@@ -68,8 +109,8 @@ def PrintFOp : FIRRTLOp<"printf"> {
   let results = (outs);
 
   let assemblyFormat = [{
-    $clock `,` $cond `,` $formatString custom<PrintfAttrs>(attr-dict)
-    (`(` $substitutions^ `)` `:` qualified(type($substitutions)))?
+    $clock `,` $cond `,` $formatString `` custom<PrintfAttrs>(attr-dict) ` `
+    (`(` $substitutions^ `)`)? `:` type($clock) `,` type($cond) (`,` qualified(type($substitutions))^)?
   }];
 }
 
@@ -97,18 +138,8 @@ def StopOp : FIRRTLOp<"stop"> {
                        StrAttr:$name);
   let results = (outs);
 
-  let assemblyFormat = "$clock `,` $cond `,` $exitCode custom<StopAttrs>(attr-dict)";
+  let assemblyFormat = "$clock `,` $cond `,` $exitCode `` custom<StopAttrs>(attr-dict) `:` type($clock) `,` type($cond)";
 }
-
-/// AtPosEdge triggers on a rise from 0 to 1/X/Z, or X/Z to 1.
-def AtPosEdge: I32EnumAttrCase<"AtPosEdge", 0, "posedge">;
-/// AtNegEdge triggers on a drop from 1 to 0/X/Z, or X/Z to 0.
-def AtNegEdge: I32EnumAttrCase<"AtNegEdge", 1, "negedge">;
-/// AtEdge(v) is syntactic sugar for "AtPosEdge(v) or AtNegEdge(v)".
-def AtEdge   : I32EnumAttrCase<"AtEdge", 2, "edge">;
-
-def EventControlAttr : I32EnumAttr<"EventControl", "edge control trigger",
-                                   [AtPosEdge, AtNegEdge, AtEdge]>  {}
 
 class VerifOp<string mnemonic, list<Trait> traits = []> :
     FIRRTLOp<mnemonic, traits> {
@@ -127,7 +158,7 @@ class VerifOp<string mnemonic, list<Trait> traits = []> :
 
   let assemblyFormat = [{
     $clock `,` $predicate `,` $enable `,`
-    $message (`(` $substitutions^ `)` `:` qualified(type($substitutions)))?
+    $message (`(` $substitutions^ `)`)? `:` type($clock) `,` type($predicate) `,` type($enable) (`,` qualified(type($substitutions))^)?
     custom<VerifAttrs>(attr-dict)
   }];
 }
@@ -165,7 +196,7 @@ def WhenOp : FIRRTLOp<"when", [SingleBlock, NoTerminator, NoRegionArguments,
   ];
 
   let assemblyFormat =
-    "$condition $thenRegion (`else` $elseRegion^)? attr-dict-with-keyword";
+    "$condition `:` type($condition) $thenRegion (`else` $elseRegion^)? attr-dict-with-keyword";
 
   let extraClassDeclaration = [{
 
@@ -216,3 +247,5 @@ def ProbeOp : FIRRTLOp<"probe"> {
 
   let assemblyFormat = "$inner_sym attr-dict ( `,` $captured^  `:` qualified(type($captured)))?";
 }
+
+#endif // CIRCT_DIALECT_FIRRTL_FIRRTLSTATEMENTS_TD

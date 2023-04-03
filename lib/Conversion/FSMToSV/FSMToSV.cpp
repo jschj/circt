@@ -282,7 +282,7 @@ private:
 
     // An optional default value to be assigned before the case statement, if
     // the case is not fully specified for all states.
-    Optional<Value> defaultValue = {};
+    std::optional<Value> defaultValue = {};
   };
 
   // Build an SV-based case mux for the given assignments. Assignments are
@@ -614,7 +614,9 @@ MachineOpConverter::convertTransitions( // NOLINT(misc-no-recursion)
       if (failed(guardOpRes))
         return failure();
 
-      auto guard = cast<ReturnOp>(*guardOpRes).getOperand();
+      auto guardOp = cast<ReturnOp>(*guardOpRes);
+      assert(guardOp && "guard should be defined");
+      auto guard = guardOp.getOperand();
       auto otherNextState =
           convertTransitions(currentState, transitions.drop_front());
       if (failed(otherNextState))

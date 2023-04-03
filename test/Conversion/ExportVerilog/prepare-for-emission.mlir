@@ -25,6 +25,25 @@ hw.module @outOfOrderInoutOperations(%a: i4) -> (c: i4) {
   hw.output %0: i4
 }
 
+// CHECK-LABEL: @twoState_variadic
+hw.module @twoState_variadic(%a: i1, %b: i1, %c: i1) -> (d:i1){
+  // CHECK:      %0 = comb.or bin %b, %c : i1
+  // CHECK-NEXT: %1 = comb.or bin %a, %0 : i1
+  // CHECK-NEXT: hw.output %1 : i1
+  %0 = comb.or bin %a, %b, %c: i1
+  hw.output %0: i1
+}
+
+// CHECK-LABEL: @carryOverWireAttrs
+hw.module @carryOverWireAttrs(%a: i1) -> (b: i1){
+  // CHECK-NEXT: %foo = sv.wire {magic, sv.attributes = []} : !hw.inout<i1>
+  // CHECK-NEXT: sv.assign %foo, %a
+  // CHECK-NEXT: [[TMP:%.+]] = sv.read_inout %foo
+  // CHECK-NEXT: hw.output [[TMP]] : i1
+  %foo = hw.wire %a {magic, sv.attributes = []} : i1
+  hw.output %foo : i1
+}
+
 // -----
 
 module {

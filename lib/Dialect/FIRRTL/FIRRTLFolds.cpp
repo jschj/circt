@@ -19,6 +19,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -29,12 +30,13 @@ using namespace firrtl;
 // write.
 static Value dropWrite(PatternRewriter &rewriter, OpResult old,
                        Value passthrough) {
-  for (auto *user : llvm::make_early_inc_range(old.getUsers())) {
-    if (isa<StrictConnectOp, ConnectOp>(user)) {
-      if (user->getOperand(0) == old)
+  SmallPtrSet<Operation *, 8> users;
+  for (auto *user : old.getUsers())
+    users.insert(user);
+  for (Operation *user : users)
+    if (auto connect = dyn_cast<FConnectLike>(user))
+      if (connect.getDest() == old)
         rewriter.eraseOp(user);
-    }
-  }
   return passthrough;
 }
 
@@ -141,8 +143,8 @@ bool circt::firrtl::hasDroppableName(Operation *op) {
 /// This makes constant folding significantly easier, as we can simply pass the
 /// operands to an operation through this function to appropriately replace any
 /// zero-width dynamic values or invalid values with a constant of value 0.
-static Optional<APSInt> getExtendedConstant(Value operand, Attribute constant,
-                                            int32_t destWidth) {
+static std::optional<APSInt>
+getExtendedConstant(Value operand, Attribute constant, int32_t destWidth) {
   assert(operand.getType().isa<IntType>() &&
          "getExtendedConstant is limited to integer types");
 
@@ -162,7 +164,7 @@ static Optional<APSInt> getExtendedConstant(Value operand, Attribute constant,
 }
 
 /// Determine the value of a constant operand for the sake of constant folding.
-static Optional<APSInt> getConstant(Attribute operand) {
+static std::optional<APSInt> getConstant(Attribute operand) {
   if (!operand)
     return {};
   if (auto attr = operand.dyn_cast<BoolAttr>())
@@ -194,10 +196,9 @@ enum class BinOpKind {
 /// result type if \p useDstWidth is true, else to the larger of the two operand
 /// bit widths and depending on whether the operation is to be performed on
 /// signed or unsigned operands.
-static Attribute
-constFoldFIRRTLBinaryOp(Operation *op, ArrayRef<Attribute> operands,
-                        BinOpKind opKind,
-                        const function_ref<APInt(APSInt, APSInt)> &calculate) {
+static Attribute constFoldFIRRTLBinaryOp(
+    Operation *op, ArrayRef<Attribute> operands, BinOpKind opKind,
+    const function_ref<APInt(const APSInt &, const APSInt &)> &calculate) {
   assert(operands.size() == 2 && "binary op takes two operands");
 
   // We cannot fold something to an unknown width.
@@ -287,9 +288,8 @@ static LogicalResult canonicalizePrimOp(
   for (auto operand : op->getOperands()) {
     Attribute attr;
     if (auto *defOp = operand.getDefiningOp())
-      TypeSwitch<Operation *>(defOp)
-          .Case<ConstantOp, SpecialConstantOp, InvalidValueOp>(
-              [&](auto op) { attr = op.fold({}).template get<Attribute>(); });
+      TypeSwitch<Operation *>(defOp).Case<ConstantOp, SpecialConstantOp>(
+          [&](auto op) { attr = op.getValueAttr(); });
     constOperands.push_back(attr);
   }
 
@@ -344,67 +344,66 @@ static APInt getMaxSignedValue(unsigned bitWidth) {
 // Fold Hooks
 //===----------------------------------------------------------------------===//
 
-OpFoldResult ConstantOp::fold(ArrayRef<Attribute> operands) {
-  assert(operands.empty() && "constant has no operands");
+OpFoldResult ConstantOp::fold(FoldAdaptor adaptor) {
+  assert(adaptor.getOperands().empty() && "constant has no operands");
   return getValueAttr();
 }
 
-OpFoldResult SpecialConstantOp::fold(ArrayRef<Attribute> operands) {
-  assert(operands.empty() && "constant has no operands");
+OpFoldResult SpecialConstantOp::fold(FoldAdaptor adaptor) {
+  assert(adaptor.getOperands().empty() && "constant has no operands");
   return getValueAttr();
 }
 
-OpFoldResult AggregateConstantOp::fold(ArrayRef<Attribute> operands) {
-  assert(operands.empty() && "constant has no operands");
+OpFoldResult AggregateConstantOp::fold(FoldAdaptor adaptor) {
+  assert(adaptor.getOperands().empty() && "constant has no operands");
   return getFieldsAttr();
-}
-
-OpFoldResult InvalidValueOp::fold(ArrayRef<Attribute> operands) {
-  return InvalidValueAttr::get(getType());
 }
 
 //===----------------------------------------------------------------------===//
 // Binary Operators
 //===----------------------------------------------------------------------===//
 
-OpFoldResult AddPrimOp::fold(ArrayRef<Attribute> operands) {
-  return constFoldFIRRTLBinaryOp(*this, operands, BinOpKind::Normal,
-                                 [=](APSInt a, APSInt b) { return a + b; });
+OpFoldResult AddPrimOp::fold(FoldAdaptor adaptor) {
+  return constFoldFIRRTLBinaryOp(
+      *this, adaptor.getOperands(), BinOpKind::Normal,
+      [=](const APSInt &a, const APSInt &b) { return a + b; });
 }
 
 void AddPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                             MLIRContext *context) {
-  results
-      .insert<patterns::moveConstAdd, patterns::AddOfZero, patterns::AddOfSelf>(
-          context);
+  results.insert<patterns::moveConstAdd, patterns::AddOfZero,
+                 patterns::AddOfSelf, patterns::AddOfPad>(context);
 }
 
-OpFoldResult SubPrimOp::fold(ArrayRef<Attribute> operands) {
-  return constFoldFIRRTLBinaryOp(*this, operands, BinOpKind::Normal,
-                                 [=](APSInt a, APSInt b) { return a - b; });
+OpFoldResult SubPrimOp::fold(FoldAdaptor adaptor) {
+  return constFoldFIRRTLBinaryOp(
+      *this, adaptor.getOperands(), BinOpKind::Normal,
+      [=](const APSInt &a, const APSInt &b) { return a - b; });
 }
 
 void SubPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                             MLIRContext *context) {
   results.insert<patterns::SubOfZero, patterns::SubFromZeroSigned,
-                 patterns::SubFromZeroUnsigned, patterns::SubOfSelf>(context);
+                 patterns::SubFromZeroUnsigned, patterns::SubOfSelf,
+                 patterns::SubOfPadL, patterns::SubOfPadR>(context);
 }
 
-OpFoldResult MulPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult MulPrimOp::fold(FoldAdaptor adaptor) {
   // mul(x, 0) -> 0
   //
   // This is legal because it aligns with the Scala FIRRTL Compiler
   // interpretation of lowering invalid to constant zero before constant
   // propagation.  Note: the Scala FIRRTL Compiler does NOT currently optimize
   // multiplication this way and will emit "x * 0".
-  if (isConstantZero(operands[1]) || isConstantZero(operands[0]))
+  if (isConstantZero(adaptor.getRhs()) || isConstantZero(adaptor.getLhs()))
     return getIntZerosAttr(getType());
 
-  return constFoldFIRRTLBinaryOp(*this, operands, BinOpKind::Normal,
-                                 [=](APSInt a, APSInt b) { return a * b; });
+  return constFoldFIRRTLBinaryOp(
+      *this, adaptor.getOperands(), BinOpKind::Normal,
+      [=](const APSInt &a, const APSInt &b) { return a * b; });
 }
 
-OpFoldResult DivPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult DivPrimOp::fold(FoldAdaptor adaptor) {
   /// div(x, x) -> 1
   ///
   /// Division by zero is undefined in the FIRRTL specification.  This fold
@@ -426,7 +425,7 @@ OpFoldResult DivPrimOp::fold(ArrayRef<Attribute> operands) {
   // interpretation of lowering invalid to constant zero before constant
   // propagation.  Note: the Scala FIRRTL Compiler does NOT currently optimize
   // division this way and will emit "0 / x".
-  if (isConstantZero(operands[0]) && !isConstantZero(operands[1]))
+  if (isConstantZero(adaptor.getLhs()) && !isConstantZero(adaptor.getRhs()))
     return getIntZerosAttr(getType());
 
   /// div(x, 1) -> x : (uint, uint) -> uint
@@ -434,19 +433,20 @@ OpFoldResult DivPrimOp::fold(ArrayRef<Attribute> operands) {
   /// UInt division by one returns the numerator. SInt division can't
   /// be folded here because it increases the return type bitwidth by
   /// one and requires sign extension (a new op).
-  if (auto rhsCst = operands[1].dyn_cast_or_null<IntegerAttr>())
+  if (auto rhsCst = adaptor.getRhs().dyn_cast_or_null<IntegerAttr>())
     if (rhsCst.getValue().isOne() && getLhs().getType() == getType())
       return getLhs();
 
-  return constFoldFIRRTLBinaryOp(*this, operands, BinOpKind::DivideOrShift,
-                                 [=](APSInt a, APSInt b) -> APInt {
-                                   if (!!b)
-                                     return a / b;
-                                   return APInt(a.getBitWidth(), 0);
-                                 });
+  return constFoldFIRRTLBinaryOp(
+      *this, adaptor.getOperands(), BinOpKind::DivideOrShift,
+      [=](const APSInt &a, const APSInt &b) -> APInt {
+        if (!!b)
+          return a / b;
+        return APInt(a.getBitWidth(), 0);
+      });
 }
 
-OpFoldResult RemPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult RemPrimOp::fold(FoldAdaptor adaptor) {
   // rem(x, x) -> 0
   //
   // Division by zero is undefined in the FIRRTL specification.  This fold
@@ -462,42 +462,42 @@ OpFoldResult RemPrimOp::fold(ArrayRef<Attribute> operands) {
   // interpretation of lowering invalid to constant zero before constant
   // propagation.  Note: the Scala FIRRTL Compiler does NOT currently optimize
   // division this way and will emit "0 % x".
-  if (isConstantZero(operands[0]))
+  if (isConstantZero(adaptor.getLhs()))
     return getIntZerosAttr(getType());
 
-  return constFoldFIRRTLBinaryOp(*this, operands, BinOpKind::DivideOrShift,
-                                 [=](APSInt a, APSInt b) -> APInt {
-                                   if (!!b)
-                                     return a % b;
-                                   return APInt(a.getBitWidth(), 0);
-                                 });
-}
-
-OpFoldResult DShlPrimOp::fold(ArrayRef<Attribute> operands) {
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::DivideOrShift,
-      [=](APSInt a, APSInt b) -> APInt { return a.shl(b); });
+      *this, adaptor.getOperands(), BinOpKind::DivideOrShift,
+      [=](const APSInt &a, const APSInt &b) -> APInt {
+        if (!!b)
+          return a % b;
+        return APInt(a.getBitWidth(), 0);
+      });
 }
 
-OpFoldResult DShlwPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult DShlPrimOp::fold(FoldAdaptor adaptor) {
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::DivideOrShift,
-      [=](APSInt a, APSInt b) -> APInt { return a.shl(b); });
+      *this, adaptor.getOperands(), BinOpKind::DivideOrShift,
+      [=](const APSInt &a, const APSInt &b) -> APInt { return a.shl(b); });
 }
 
-OpFoldResult DShrPrimOp::fold(ArrayRef<Attribute> operands) {
-  return constFoldFIRRTLBinaryOp(*this, operands, BinOpKind::DivideOrShift,
-                                 [=](APSInt a, APSInt b) -> APInt {
-                                   return getType().isUnsigned() ||
-                                                  !a.getBitWidth()
-                                              ? a.lshr(b)
-                                              : a.ashr(b);
-                                 });
+OpFoldResult DShlwPrimOp::fold(FoldAdaptor adaptor) {
+  return constFoldFIRRTLBinaryOp(
+      *this, adaptor.getOperands(), BinOpKind::DivideOrShift,
+      [=](const APSInt &a, const APSInt &b) -> APInt { return a.shl(b); });
+}
+
+OpFoldResult DShrPrimOp::fold(FoldAdaptor adaptor) {
+  return constFoldFIRRTLBinaryOp(
+      *this, adaptor.getOperands(), BinOpKind::DivideOrShift,
+      [=](const APSInt &a, const APSInt &b) -> APInt {
+        return getType().isUnsigned() || !a.getBitWidth() ? a.lshr(b)
+                                                          : a.ashr(b);
+      });
 }
 
 // TODO: Move to DRR.
-OpFoldResult AndPrimOp::fold(ArrayRef<Attribute> operands) {
-  if (auto rhsCst = getConstant(operands[1])) {
+OpFoldResult AndPrimOp::fold(FoldAdaptor adaptor) {
+  if (auto rhsCst = getConstant(adaptor.getRhs())) {
     /// and(x, 0) -> 0, 0 is largest or is implicit zero extended
     if (rhsCst->isZero())
       return getIntZerosAttr(getType());
@@ -508,7 +508,7 @@ OpFoldResult AndPrimOp::fold(ArrayRef<Attribute> operands) {
       return getLhs();
   }
 
-  if (auto lhsCst = getConstant(operands[0])) {
+  if (auto lhsCst = getConstant(adaptor.getLhs())) {
     /// and(0, x) -> 0, 0 is largest or is implicit zero extended
     if (lhsCst->isZero())
       return getIntZerosAttr(getType());
@@ -524,19 +524,20 @@ OpFoldResult AndPrimOp::fold(ArrayRef<Attribute> operands) {
     return getRhs();
 
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::Normal,
-      [](APSInt a, APSInt b) -> APInt { return a & b; });
+      *this, adaptor.getOperands(), BinOpKind::Normal,
+      [](const APSInt &a, const APSInt &b) -> APInt { return a & b; });
 }
 
 void AndPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                             MLIRContext *context) {
   results
       .insert<patterns::extendAnd, patterns::moveConstAnd, patterns::AndOfZero,
-              patterns::AndOfAllOne, patterns::AndOfSelf>(context);
+              patterns::AndOfAllOne, patterns::AndOfSelf, patterns::AndOfPad>(
+          context);
 }
 
-OpFoldResult OrPrimOp::fold(ArrayRef<Attribute> operands) {
-  if (auto rhsCst = getConstant(operands[1])) {
+OpFoldResult OrPrimOp::fold(FoldAdaptor adaptor) {
+  if (auto rhsCst = getConstant(adaptor.getRhs())) {
     /// or(x, 0) -> x
     if (rhsCst->isZero() && getLhs().getType() == getType())
       return getLhs();
@@ -547,7 +548,7 @@ OpFoldResult OrPrimOp::fold(ArrayRef<Attribute> operands) {
       return getRhs();
   }
 
-  if (auto lhsCst = getConstant(operands[0])) {
+  if (auto lhsCst = getConstant(adaptor.getLhs())) {
     /// or(0, x) -> x
     if (lhsCst->isZero() && getRhs().getType() == getType())
       return getRhs();
@@ -563,24 +564,25 @@ OpFoldResult OrPrimOp::fold(ArrayRef<Attribute> operands) {
     return getRhs();
 
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::Normal,
-      [](APSInt a, APSInt b) -> APInt { return a | b; });
+      *this, adaptor.getOperands(), BinOpKind::Normal,
+      [](const APSInt &a, const APSInt &b) -> APInt { return a | b; });
 }
 
 void OrPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                            MLIRContext *context) {
   results.insert<patterns::extendOr, patterns::moveConstOr, patterns::OrOfZero,
-                 patterns::OrOfAllOne, patterns::OrOfSelf>(context);
+                 patterns::OrOfAllOne, patterns::OrOfSelf, patterns::OrOfPad>(
+      context);
 }
 
-OpFoldResult XorPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult XorPrimOp::fold(FoldAdaptor adaptor) {
   /// xor(x, 0) -> x
-  if (auto rhsCst = getConstant(operands[1]))
+  if (auto rhsCst = getConstant(adaptor.getRhs()))
     if (rhsCst->isZero() && getLhs().getType() == getType())
       return getLhs();
 
   /// xor(x, 0) -> x
-  if (auto lhsCst = getConstant(operands[0]))
+  if (auto lhsCst = getConstant(adaptor.getLhs()))
     if (lhsCst->isZero() && getRhs().getType() == getType())
       return getRhs();
 
@@ -590,14 +592,15 @@ OpFoldResult XorPrimOp::fold(ArrayRef<Attribute> operands) {
                       APInt(std::max(getType().getWidthOrSentinel(), 0), 0));
 
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::Normal,
-      [](APSInt a, APSInt b) -> APInt { return a ^ b; });
+      *this, adaptor.getOperands(), BinOpKind::Normal,
+      [](const APSInt &a, const APSInt &b) -> APInt { return a ^ b; });
 }
 
 void XorPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                             MLIRContext *context) {
   results.insert<patterns::extendXor, patterns::moveConstXor,
-                 patterns::XorOfZero, patterns::XorOfSelf>(context);
+                 patterns::XorOfZero, patterns::XorOfSelf, patterns::XorOfPad>(
+      context);
 }
 
 void LEQPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
@@ -605,16 +608,16 @@ void LEQPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.insert<patterns::LEQWithConstLHS>(context);
 }
 
-OpFoldResult LEQPrimOp::fold(ArrayRef<Attribute> operands) {
-  bool isUnsigned = getLhs().getType().isa<UIntType>();
+OpFoldResult LEQPrimOp::fold(FoldAdaptor adaptor) {
+  bool isUnsigned = getLhs().getType().isUnsigned();
 
   // leq(x, x) -> 1
   if (getLhs() == getRhs())
     return getIntAttr(getType(), APInt(1, 1));
 
   // Comparison against constant outside type bounds.
-  if (auto width = getLhs().getType().cast<IntType>().getWidth()) {
-    if (auto rhsCst = getConstant(operands[1])) {
+  if (auto width = getLhs().getType().getWidth()) {
+    if (auto rhsCst = getConstant(adaptor.getRhs())) {
       auto commonWidth = std::max<int32_t>(*width, rhsCst->getBitWidth());
       commonWidth = std::max(commonWidth, 1);
 
@@ -639,8 +642,10 @@ OpFoldResult LEQPrimOp::fold(ArrayRef<Attribute> operands) {
   }
 
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::Compare,
-      [=](APSInt a, APSInt b) -> APInt { return APInt(1, a <= b); });
+      *this, adaptor.getOperands(), BinOpKind::Compare,
+      [=](const APSInt &a, const APSInt &b) -> APInt {
+        return APInt(1, a <= b);
+      });
 }
 
 void LTPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
@@ -648,22 +653,22 @@ void LTPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.insert<patterns::LTWithConstLHS>(context);
 }
 
-OpFoldResult LTPrimOp::fold(ArrayRef<Attribute> operands) {
-  bool isUnsigned = getLhs().getType().isa<UIntType>();
+OpFoldResult LTPrimOp::fold(FoldAdaptor adaptor) {
+  bool isUnsigned = getLhs().getType().isUnsigned();
 
   // lt(x, x) -> 0
   if (getLhs() == getRhs())
     return getIntAttr(getType(), APInt(1, 0));
 
   // lt(x, 0) -> 0 when x is unsigned
-  if (auto rhsCst = getConstant(operands[1])) {
-    if (rhsCst->isZero() && getLhs().getType().isa<UIntType>())
+  if (auto rhsCst = getConstant(adaptor.getRhs())) {
+    if (rhsCst->isZero() && getLhs().getType().isUnsigned())
       return getIntAttr(getType(), APInt(1, 0));
   }
 
   // Comparison against constant outside type bounds.
-  if (auto width = getLhs().getType().cast<IntType>().getWidth()) {
-    if (auto rhsCst = getConstant(operands[1])) {
+  if (auto width = getLhs().getType().getWidth()) {
+    if (auto rhsCst = getConstant(adaptor.getRhs())) {
       auto commonWidth = std::max<int32_t>(*width, rhsCst->getBitWidth());
       commonWidth = std::max(commonWidth, 1);
 
@@ -688,8 +693,10 @@ OpFoldResult LTPrimOp::fold(ArrayRef<Attribute> operands) {
   }
 
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::Compare,
-      [=](APSInt a, APSInt b) -> APInt { return APInt(1, a < b); });
+      *this, adaptor.getOperands(), BinOpKind::Compare,
+      [=](const APSInt &a, const APSInt &b) -> APInt {
+        return APInt(1, a < b);
+      });
 }
 
 void GEQPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
@@ -697,22 +704,22 @@ void GEQPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.insert<patterns::GEQWithConstLHS>(context);
 }
 
-OpFoldResult GEQPrimOp::fold(ArrayRef<Attribute> operands) {
-  bool isUnsigned = getLhs().getType().isa<UIntType>();
+OpFoldResult GEQPrimOp::fold(FoldAdaptor adaptor) {
+  bool isUnsigned = getLhs().getType().isUnsigned();
 
   // geq(x, x) -> 1
   if (getLhs() == getRhs())
     return getIntAttr(getType(), APInt(1, 1));
 
   // geq(x, 0) -> 1 when x is unsigned
-  if (auto rhsCst = getConstant(operands[1])) {
-    if (rhsCst->isZero() && getLhs().getType().isa<UIntType>())
+  if (auto rhsCst = getConstant(adaptor.getRhs())) {
+    if (rhsCst->isZero() && isUnsigned)
       return getIntAttr(getType(), APInt(1, 1));
   }
 
   // Comparison against constant outside type bounds.
-  if (auto width = getLhs().getType().cast<IntType>().getWidth()) {
-    if (auto rhsCst = getConstant(operands[1])) {
+  if (auto width = getLhs().getType().getWidth()) {
+    if (auto rhsCst = getConstant(adaptor.getRhs())) {
       auto commonWidth = std::max<int32_t>(*width, rhsCst->getBitWidth());
       commonWidth = std::max(commonWidth, 1);
 
@@ -737,8 +744,10 @@ OpFoldResult GEQPrimOp::fold(ArrayRef<Attribute> operands) {
   }
 
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::Compare,
-      [=](APSInt a, APSInt b) -> APInt { return APInt(1, a >= b); });
+      *this, adaptor.getOperands(), BinOpKind::Compare,
+      [=](const APSInt &a, const APSInt &b) -> APInt {
+        return APInt(1, a >= b);
+      });
 }
 
 void GTPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
@@ -746,16 +755,16 @@ void GTPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.insert<patterns::GTWithConstLHS>(context);
 }
 
-OpFoldResult GTPrimOp::fold(ArrayRef<Attribute> operands) {
-  bool isUnsigned = getLhs().getType().isa<UIntType>();
+OpFoldResult GTPrimOp::fold(FoldAdaptor adaptor) {
+  bool isUnsigned = getLhs().getType().isUnsigned();
 
   // gt(x, x) -> 0
   if (getLhs() == getRhs())
     return getIntAttr(getType(), APInt(1, 0));
 
   // Comparison against constant outside type bounds.
-  if (auto width = getLhs().getType().cast<IntType>().getWidth()) {
-    if (auto rhsCst = getConstant(operands[1])) {
+  if (auto width = getLhs().getType().getWidth()) {
+    if (auto rhsCst = getConstant(adaptor.getRhs())) {
       auto commonWidth = std::max<int32_t>(*width, rhsCst->getBitWidth());
       commonWidth = std::max(commonWidth, 1);
 
@@ -780,16 +789,18 @@ OpFoldResult GTPrimOp::fold(ArrayRef<Attribute> operands) {
   }
 
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::Compare,
-      [=](APSInt a, APSInt b) -> APInt { return APInt(1, a > b); });
+      *this, adaptor.getOperands(), BinOpKind::Compare,
+      [=](const APSInt &a, const APSInt &b) -> APInt {
+        return APInt(1, a > b);
+      });
 }
 
-OpFoldResult EQPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult EQPrimOp::fold(FoldAdaptor adaptor) {
   // eq(x, x) -> 1
   if (getLhs() == getRhs())
     return getIntAttr(getType(), APInt(1, 1));
 
-  if (auto rhsCst = getConstant(operands[1])) {
+  if (auto rhsCst = getConstant(adaptor.getRhs())) {
     /// eq(x, 1) -> x when x is 1 bit.
     /// TODO: Support SInt<1> on the LHS etc.
     if (rhsCst->isAllOnes() && getLhs().getType() == getType() &&
@@ -798,16 +809,17 @@ OpFoldResult EQPrimOp::fold(ArrayRef<Attribute> operands) {
   }
 
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::Compare,
-      [=](APSInt a, APSInt b) -> APInt { return APInt(1, a == b); });
+      *this, adaptor.getOperands(), BinOpKind::Compare,
+      [=](const APSInt &a, const APSInt &b) -> APInt {
+        return APInt(1, a == b);
+      });
 }
 
 LogicalResult EQPrimOp::canonicalize(EQPrimOp op, PatternRewriter &rewriter) {
   return canonicalizePrimOp(
       op, rewriter, [&](ArrayRef<Attribute> operands) -> OpFoldResult {
         if (auto rhsCst = getConstant(operands[1])) {
-          auto width =
-              op.getLhs().getType().cast<IntType>().getBitWidthOrSentinel();
+          auto width = op.getLhs().getType().getBitWidthOrSentinel();
 
           // eq(x, 0) ->  not(x) when x is 1 bit.
           if (rhsCst->isZero() && op.getLhs().getType() == op.getType() &&
@@ -834,12 +846,12 @@ LogicalResult EQPrimOp::canonicalize(EQPrimOp op, PatternRewriter &rewriter) {
       });
 }
 
-OpFoldResult NEQPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult NEQPrimOp::fold(FoldAdaptor adaptor) {
   // neq(x, x) -> 0
   if (getLhs() == getRhs())
     return getIntAttr(getType(), APInt(1, 0));
 
-  if (auto rhsCst = getConstant(operands[1])) {
+  if (auto rhsCst = getConstant(adaptor.getRhs())) {
     /// neq(x, 0) -> x when x is 1 bit.
     /// TODO: Support SInt<1> on the LHS etc.
     if (rhsCst->isZero() && getLhs().getType() == getType() &&
@@ -848,16 +860,17 @@ OpFoldResult NEQPrimOp::fold(ArrayRef<Attribute> operands) {
   }
 
   return constFoldFIRRTLBinaryOp(
-      *this, operands, BinOpKind::Compare,
-      [=](APSInt a, APSInt b) -> APInt { return APInt(1, a != b); });
+      *this, adaptor.getOperands(), BinOpKind::Compare,
+      [=](const APSInt &a, const APSInt &b) -> APInt {
+        return APInt(1, a != b);
+      });
 }
 
 LogicalResult NEQPrimOp::canonicalize(NEQPrimOp op, PatternRewriter &rewriter) {
   return canonicalizePrimOp(
       op, rewriter, [&](ArrayRef<Attribute> operands) -> OpFoldResult {
         if (auto rhsCst = getConstant(operands[1])) {
-          auto width =
-              op.getLhs().getType().cast<IntType>().getBitWidthOrSentinel();
+          auto width = op.getLhs().getType().getBitWidthOrSentinel();
 
           // neq(x, 1) -> not(x) when x is 1 bit
           if (rhsCst->isAllOnes() && op.getLhs().getType() == op.getType() &&
@@ -888,7 +901,22 @@ LogicalResult NEQPrimOp::canonicalize(NEQPrimOp op, PatternRewriter &rewriter) {
 // Unary Operators
 //===----------------------------------------------------------------------===//
 
-OpFoldResult AsSIntPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult SizeOfIntrinsicOp::fold(FoldAdaptor) {
+  auto base = getInput().getType();
+  auto w = base.getBitWidthOrSentinel();
+  if (w >= 0)
+    return getIntAttr(getType(), APInt(32, w));
+  return {};
+}
+
+OpFoldResult IsXIntrinsicOp::fold(FoldAdaptor adaptor) {
+  // No constant can be 'x' by definition.
+  if (auto cst = getConstant(adaptor.getArg()))
+    return getIntAttr(getType(), APInt(1, 0));
+  return {};
+}
+
+OpFoldResult AsSIntPrimOp::fold(FoldAdaptor adaptor) {
   // No effect.
   if (getInput().getType() == getType())
     return getInput();
@@ -897,13 +925,13 @@ OpFoldResult AsSIntPrimOp::fold(ArrayRef<Attribute> operands) {
   // Otherwise width inference may produce differently-sized constants if the
   // sign changes.
   if (getType().hasWidth())
-    if (auto cst = getConstant(operands[0]))
+    if (auto cst = getConstant(adaptor.getInput()))
       return getIntAttr(getType(), *cst);
 
   return {};
 }
 
-OpFoldResult AsUIntPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult AsUIntPrimOp::fold(FoldAdaptor adaptor) {
   // No effect.
   if (getInput().getType() == getType())
     return getInput();
@@ -912,73 +940,78 @@ OpFoldResult AsUIntPrimOp::fold(ArrayRef<Attribute> operands) {
   // Otherwise width inference may produce differently-sized constants if the
   // sign changes.
   if (getType().hasWidth())
-    if (auto cst = getConstant(operands[0]))
+    if (auto cst = getConstant(adaptor.getInput()))
       return getIntAttr(getType(), *cst);
 
   return {};
 }
 
-OpFoldResult AsAsyncResetPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult AsAsyncResetPrimOp::fold(FoldAdaptor adaptor) {
   // No effect.
   if (getInput().getType() == getType())
     return getInput();
 
   // Constant fold.
-  if (auto cst = getConstant(operands[0]))
+  if (auto cst = getConstant(adaptor.getInput()))
     return BoolAttr::get(getContext(), cst->getBoolValue());
 
   return {};
 }
 
-OpFoldResult AsClockPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult AsClockPrimOp::fold(FoldAdaptor adaptor) {
   // No effect.
   if (getInput().getType() == getType())
     return getInput();
 
   // Constant fold.
-  if (auto cst = getConstant(operands[0]))
+  if (auto cst = getConstant(adaptor.getInput()))
     return BoolAttr::get(getContext(), cst->getBoolValue());
 
   return {};
 }
 
-OpFoldResult CvtPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult CvtPrimOp::fold(FoldAdaptor adaptor) {
   if (!hasKnownWidthIntTypes(*this))
     return {};
 
   // Signed to signed is a noop, unsigned operands prepend a zero bit.
-  if (auto cst = getExtendedConstant(getOperand(), operands[0],
+  if (auto cst = getExtendedConstant(getOperand(), adaptor.getInput(),
                                      getType().getWidthOrSentinel()))
     return getIntAttr(getType(), *cst);
 
   return {};
 }
 
-OpFoldResult NegPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult NegPrimOp::fold(FoldAdaptor adaptor) {
   if (!hasKnownWidthIntTypes(*this))
     return {};
 
   // FIRRTL negate always adds a bit.
   // -x ---> 0-sext(x) or 0-zext(x)
-  if (auto cst = getExtendedConstant(getOperand(), operands[0],
+  if (auto cst = getExtendedConstant(getOperand(), adaptor.getInput(),
                                      getType().getWidthOrSentinel()))
     return getIntAttr(getType(), APInt((*cst).getBitWidth(), 0) - *cst);
 
   return {};
 }
 
-OpFoldResult NotPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult NotPrimOp::fold(FoldAdaptor adaptor) {
   if (!hasKnownWidthIntTypes(*this))
     return {};
 
-  if (auto cst = getExtendedConstant(getOperand(), operands[0],
+  if (auto cst = getExtendedConstant(getOperand(), adaptor.getInput(),
                                      getType().getWidthOrSentinel()))
     return getIntAttr(getType(), ~*cst);
 
   return {};
 }
 
-OpFoldResult AndRPrimOp::fold(ArrayRef<Attribute> operands) {
+void NotPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                            MLIRContext *context) {
+  results.insert<patterns::NotNot>(context);
+}
+
+OpFoldResult AndRPrimOp::fold(FoldAdaptor adaptor) {
   if (!hasKnownWidthIntTypes(*this))
     return {};
 
@@ -986,7 +1019,7 @@ OpFoldResult AndRPrimOp::fold(ArrayRef<Attribute> operands) {
     return getIntAttr(getType(), APInt(1, 1));
 
   // x == -1
-  if (auto cst = getConstant(operands[0]))
+  if (auto cst = getConstant(adaptor.getInput()))
     return getIntAttr(getType(), APInt(1, cst->isAllOnes()));
 
   // one bit is identity.  Only applies to UInt since we can't make a cast
@@ -997,7 +1030,7 @@ OpFoldResult AndRPrimOp::fold(ArrayRef<Attribute> operands) {
   return {};
 }
 
-OpFoldResult OrRPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult OrRPrimOp::fold(FoldAdaptor adaptor) {
   if (!hasKnownWidthIntTypes(*this))
     return {};
 
@@ -1005,7 +1038,7 @@ OpFoldResult OrRPrimOp::fold(ArrayRef<Attribute> operands) {
     return getIntAttr(getType(), APInt(1, 0));
 
   // x != 0
-  if (auto cst = getConstant(operands[0]))
+  if (auto cst = getConstant(adaptor.getInput()))
     return getIntAttr(getType(), APInt(1, !cst->isZero()));
 
   // one bit is identity.  Only applies to UInt since we can't make a cast
@@ -1016,7 +1049,7 @@ OpFoldResult OrRPrimOp::fold(ArrayRef<Attribute> operands) {
   return {};
 }
 
-OpFoldResult XorRPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult XorRPrimOp::fold(FoldAdaptor adaptor) {
   if (!hasKnownWidthIntTypes(*this))
     return {};
 
@@ -1024,8 +1057,8 @@ OpFoldResult XorRPrimOp::fold(ArrayRef<Attribute> operands) {
     return getIntAttr(getType(), APInt(1, 0));
 
   // popcount(x) & 1
-  if (auto cst = getConstant(operands[0]))
-    return getIntAttr(getType(), APInt(1, cst->countPopulation() & 1));
+  if (auto cst = getConstant(adaptor.getInput()))
+    return getIntAttr(getType(), APInt(1, cst->popcount() & 1));
 
   // one bit is identity.  Only applies to UInt since we can't make a cast here.
   if (isUInt1(getInput().getType()))
@@ -1038,19 +1071,23 @@ OpFoldResult XorRPrimOp::fold(ArrayRef<Attribute> operands) {
 // Other Operators
 //===----------------------------------------------------------------------===//
 
-OpFoldResult CatPrimOp::fold(ArrayRef<Attribute> operands) {
-
-  if (getLhs().getType().getBitWidthOrSentinel() == 0)
+OpFoldResult CatPrimOp::fold(FoldAdaptor adaptor) {
+  // cat(x, 0-width) -> x
+  // cat(0-width, x) -> x
+  // Limit to unsigned (result type), as cannot insert cast here.
+  if (getLhs().getType().getBitWidthOrSentinel() == 0 &&
+      getRhs().getType().isUnsigned())
     return getRhs();
-  if (getRhs().getType().getBitWidthOrSentinel() == 0)
+  if (getRhs().getType().getBitWidthOrSentinel() == 0 &&
+      getLhs().getType().isUnsigned())
     return getLhs();
 
   if (!hasKnownWidthIntTypes(*this))
     return {};
 
   // Constant fold cat.
-  if (auto lhs = getConstant(operands[0]))
-    if (auto rhs = getConstant(operands[1]))
+  if (auto lhs = getConstant(adaptor.getLhs()))
+    if (auto rhs = getConstant(adaptor.getRhs()))
       return getIntAttr(getType(), lhs->concat(*rhs));
 
   return {};
@@ -1095,10 +1132,10 @@ struct CatBitsBits : public mlir::RewritePattern {
 
 void CatPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                             MLIRContext *context) {
-  results.insert<CatBitsBits>(context);
+  results.insert<CatBitsBits, patterns::CatDoubleConst>(context);
 }
 
-OpFoldResult BitCastOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult BitCastOp::fold(FoldAdaptor adaptor) {
   auto op = (*this);
   // BitCast is redundant if input and result types are same.
   if (op.getType() == op.getInput().getType())
@@ -1113,15 +1150,15 @@ OpFoldResult BitCastOp::fold(ArrayRef<Attribute> operands) {
   return {};
 }
 
-OpFoldResult BitsPrimOp::fold(ArrayRef<Attribute> operands) {
-  auto inputType = getInput().getType().cast<FIRRTLBaseType>();
+OpFoldResult BitsPrimOp::fold(FoldAdaptor adaptor) {
+  auto inputType = getInput().getType();
   // If we are extracting the entire input, then return it.
   if (inputType == getType() && getType().hasWidth())
     return getInput();
 
   // Constant fold.
   if (hasKnownWidthIntTypes(*this))
-    if (auto cst = getConstant(operands[0]))
+    if (auto cst = getConstant(adaptor.getInput()))
       return getIntAttr(getType(),
                         cst->extractBits(getHi() - getLo() + 1, getLo()));
 
@@ -1151,7 +1188,7 @@ static void replaceWithBits(Operation *op, Value value, unsigned hiBit,
   rewriter.replaceOp(op, value);
 }
 
-OpFoldResult MuxPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult MuxPrimOp::fold(FoldAdaptor adaptor) {
 
   // mux : UInt<0> -> 0
   if (getType().getBitWidthOrSentinel() == 0)
@@ -1168,7 +1205,7 @@ OpFoldResult MuxPrimOp::fold(ArrayRef<Attribute> operands) {
     return {};
 
   // mux(0/1, x, y) -> x or y
-  if (auto cond = getConstant(operands[0])) {
+  if (auto cond = getConstant(adaptor.getSel())) {
     if (cond->isZero() && getLow().getType() == getType())
       return getLow();
     if (!cond->isZero() && getHigh().getType() == getType())
@@ -1176,9 +1213,9 @@ OpFoldResult MuxPrimOp::fold(ArrayRef<Attribute> operands) {
   }
 
   // mux(cond, x, cst)
-  if (auto lowCst = getConstant(operands[2])) {
+  if (auto lowCst = getConstant(adaptor.getLow())) {
     // mux(cond, c1, c2)
-    if (auto highCst = getConstant(operands[1])) {
+    if (auto highCst = getConstant(adaptor.getHigh())) {
       // mux(cond, cst, cst) -> cst
       if (highCst->getBitWidth() == lowCst->getBitWidth() &&
           *highCst == *lowCst)
@@ -1216,10 +1253,8 @@ public:
     if (width < 0)
       return failure();
 
-    auto pad = [&](Value input) -> Value {
-      auto inputWidth = input.getType()
-                            .template cast<FIRRTLBaseType>()
-                            .getBitWidthOrSentinel();
+    auto pad = [&](FIRRTLBaseValue input) -> Value {
+      auto inputWidth = input.getType().getBitWidthOrSentinel();
       if (inputWidth < 0 || width == inputWidth)
         return input;
       return rewriter
@@ -1238,16 +1273,109 @@ public:
     return success();
   }
 };
+
+// Find muxes which have conditions dominated by other muxes with the same
+// condition.
+class MuxSharedCond : public mlir::RewritePattern {
+public:
+  MuxSharedCond(MLIRContext *context)
+      : RewritePattern(MuxPrimOp::getOperationName(), 0, context) {}
+
+  static const int depthLimit = 5;
+
+  Value updateOrClone(MuxPrimOp mux, Value high, Value low,
+                      mlir::PatternRewriter &rewriter,
+                      bool updateInPlace) const {
+    if (updateInPlace) {
+      rewriter.updateRootInPlace(mux, [&] {
+        mux.setOperand(1, high);
+        mux.setOperand(2, low);
+      });
+      return {};
+    }
+    rewriter.setInsertionPointAfter(mux);
+    return rewriter
+        .create<MuxPrimOp>(mux.getLoc(), mux.getType(),
+                           ValueRange{mux.getSel(), high, low})
+        .getResult();
+  }
+
+  // Walk a dependent mux tree assuming the condition cond is true.
+  Value tryCondTrue(Value op, Value cond, mlir::PatternRewriter &rewriter,
+                    bool updateInPlace, int limit) const {
+    MuxPrimOp mux = op.getDefiningOp<MuxPrimOp>();
+    if (!mux)
+      return {};
+    if (mux.getSel() == cond)
+      return mux.getHigh();
+    if (limit > depthLimit)
+      return {};
+    updateInPlace &= mux->hasOneUse();
+
+    if (Value v = tryCondTrue(mux.getHigh(), cond, rewriter, updateInPlace,
+                              limit + 1))
+      return updateOrClone(mux, v, mux.getLow(), rewriter, updateInPlace);
+
+    if (Value v =
+            tryCondTrue(mux.getLow(), cond, rewriter, updateInPlace, limit + 1))
+      return updateOrClone(mux, mux.getHigh(), v, rewriter, updateInPlace);
+    return {};
+  }
+
+  // Walk a dependent mux tree assuming the condition cond is false.
+  Value tryCondFalse(Value op, Value cond, mlir::PatternRewriter &rewriter,
+                     bool updateInPlace, int limit) const {
+    MuxPrimOp mux = op.getDefiningOp<MuxPrimOp>();
+    if (!mux)
+      return {};
+    if (mux.getSel() == cond)
+      return mux.getLow();
+    if (limit > depthLimit)
+      return {};
+    updateInPlace &= mux->hasOneUse();
+
+    if (Value v = tryCondFalse(mux.getHigh(), cond, rewriter, updateInPlace,
+                               limit + 1))
+      return updateOrClone(mux, v, mux.getLow(), rewriter, updateInPlace);
+
+    if (Value v = tryCondFalse(mux.getLow(), cond, rewriter, updateInPlace,
+                               limit + 1))
+      return updateOrClone(mux, mux.getHigh(), v, rewriter, updateInPlace);
+
+    return {};
+  }
+
+  LogicalResult
+  matchAndRewrite(Operation *op,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto mux = cast<MuxPrimOp>(op);
+    auto width = mux.getType().getBitWidthOrSentinel();
+    if (width < 0)
+      return failure();
+
+    if (Value v = tryCondTrue(mux.getHigh(), mux.getSel(), rewriter, true, 0)) {
+      rewriter.updateRootInPlace(mux, [&] { mux.setOperand(1, v); });
+      return success();
+    }
+
+    if (Value v = tryCondFalse(mux.getLow(), mux.getSel(), rewriter, true, 0)) {
+      rewriter.updateRootInPlace(mux, [&] { mux.setOperand(2, v); });
+      return success();
+    }
+
+    return failure();
+  }
+};
 } // namespace
 
 void MuxPrimOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                             MLIRContext *context) {
-  results.add<MuxPad, patterns::MuxSameCondLow, patterns::MuxSameCondHigh,
-              patterns::MuxSameTrue, patterns::MuxSameFalse,
-              patterns::NarrowMuxLHS, patterns::NarrowMuxRHS>(context);
+  results.add<MuxPad, MuxSharedCond, patterns::MuxNot, patterns::MuxSameTrue,
+              patterns::MuxSameFalse, patterns::NarrowMuxLHS,
+              patterns::NarrowMuxRHS>(context);
 }
 
-OpFoldResult PadPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult PadPrimOp::fold(FoldAdaptor adaptor) {
   auto input = this->getInput();
 
   // pad(x) -> x  if the width doesn't change.
@@ -1255,13 +1383,13 @@ OpFoldResult PadPrimOp::fold(ArrayRef<Attribute> operands) {
     return input;
 
   // Need to know the input width.
-  auto inputType = input.getType().cast<IntType>();
+  auto inputType = input.getType();
   int32_t width = inputType.getWidthOrSentinel();
   if (width == -1)
     return {};
 
   // Constant fold.
-  if (auto cst = getConstant(operands[0])) {
+  if (auto cst = getConstant(adaptor.getInput())) {
     auto destWidth = getType().getWidthOrSentinel();
     if (destWidth == -1)
       return {};
@@ -1274,9 +1402,9 @@ OpFoldResult PadPrimOp::fold(ArrayRef<Attribute> operands) {
   return {};
 }
 
-OpFoldResult ShlPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult ShlPrimOp::fold(FoldAdaptor adaptor) {
   auto input = this->getInput();
-  auto inputType = input.getType().cast<IntType>();
+  auto inputType = input.getType();
   int shiftAmount = getAmount();
 
   // shl(x, 0) -> x
@@ -1284,7 +1412,7 @@ OpFoldResult ShlPrimOp::fold(ArrayRef<Attribute> operands) {
     return input;
 
   // Constant fold.
-  if (auto cst = getConstant(operands[0])) {
+  if (auto cst = getConstant(adaptor.getInput())) {
     auto inputWidth = inputType.getWidthOrSentinel();
     if (inputWidth != -1) {
       auto resultWidth = inputWidth + shiftAmount;
@@ -1295,9 +1423,9 @@ OpFoldResult ShlPrimOp::fold(ArrayRef<Attribute> operands) {
   return {};
 }
 
-OpFoldResult ShrPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult ShrPrimOp::fold(FoldAdaptor adaptor) {
   auto input = this->getInput();
-  auto inputType = input.getType().cast<IntType>();
+  auto inputType = input.getType();
   int shiftAmount = getAmount();
 
   // shr(x, 0) -> x
@@ -1316,7 +1444,7 @@ OpFoldResult ShrPrimOp::fold(ArrayRef<Attribute> operands) {
     return getIntAttr(getType(), APInt(1, 0));
 
   // Constant fold.
-  if (auto cst = getConstant(operands[0])) {
+  if (auto cst = getConstant(adaptor.getInput())) {
     APInt value;
     if (inputType.isSigned())
       value = cst->ashr(std::min(shiftAmount, inputWidth - 1));
@@ -1329,8 +1457,7 @@ OpFoldResult ShrPrimOp::fold(ArrayRef<Attribute> operands) {
 }
 
 LogicalResult ShrPrimOp::canonicalize(ShrPrimOp op, PatternRewriter &rewriter) {
-  auto inputWidth =
-      op.getInput().getType().cast<IntType>().getWidthOrSentinel();
+  auto inputWidth = op.getInput().getType().getWidthOrSentinel();
   if (inputWidth <= 0)
     return failure();
 
@@ -1353,8 +1480,7 @@ LogicalResult ShrPrimOp::canonicalize(ShrPrimOp op, PatternRewriter &rewriter) {
 
 LogicalResult HeadPrimOp::canonicalize(HeadPrimOp op,
                                        PatternRewriter &rewriter) {
-  auto inputWidth =
-      op.getInput().getType().cast<IntType>().getWidthOrSentinel();
+  auto inputWidth = op.getInput().getType().getWidthOrSentinel();
   if (inputWidth <= 0)
     return failure();
 
@@ -1366,29 +1492,26 @@ LogicalResult HeadPrimOp::canonicalize(HeadPrimOp op,
   return success();
 }
 
-OpFoldResult HeadPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult HeadPrimOp::fold(FoldAdaptor adaptor) {
   if (hasKnownWidthIntTypes(*this))
-    if (auto cst = getConstant(operands[0])) {
-      int shiftAmount =
-          getInput().getType().cast<IntType>().getWidthOrSentinel() -
-          getAmount();
+    if (auto cst = getConstant(adaptor.getInput())) {
+      int shiftAmount = getInput().getType().getWidthOrSentinel() - getAmount();
       return getIntAttr(getType(), cst->lshr(shiftAmount).trunc(getAmount()));
     }
 
   return {};
 }
 
-OpFoldResult TailPrimOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult TailPrimOp::fold(FoldAdaptor adaptor) {
   if (hasKnownWidthIntTypes(*this))
-    if (auto cst = getConstant(operands[0]))
+    if (auto cst = getConstant(adaptor.getInput()))
       return getIntAttr(getType(), cst->trunc(getType().getWidthOrSentinel()));
   return {};
 }
 
 LogicalResult TailPrimOp::canonicalize(TailPrimOp op,
                                        PatternRewriter &rewriter) {
-  auto inputWidth =
-      op.getInput().getType().cast<IntType>().getWidthOrSentinel();
+  auto inputWidth = op.getInput().getType().getWidthOrSentinel();
   if (inputWidth <= 0)
     return failure();
 
@@ -1405,14 +1528,14 @@ void SubaccessOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.add<patterns::SubaccessOfConstant>(context);
 }
 
-OpFoldResult MultibitMuxOp::fold(ArrayRef<Attribute> operands) {
+OpFoldResult MultibitMuxOp::fold(FoldAdaptor adaptor) {
   // If there is only one input, just return it.
-  if (operands.size() == 2)
+  if (adaptor.getInputs().size() == 1)
     return getOperand(1);
 
-  if (auto constIndex = getConstant(operands[0])) {
+  if (auto constIndex = getConstant(adaptor.getIndex())) {
     auto index = constIndex->getZExtValue();
-    if (index >= 0 && index < getInputs().size())
+    if (index < getInputs().size())
       return getInputs()[getInputs().size() - 1 - index];
   }
 
@@ -1450,9 +1573,8 @@ LogicalResult MultibitMuxOp::canonicalize(MultibitMuxOp op,
     return failure();
 
   // TODO: Handle even when `index` doesn't have uint<1>.
-  auto uintType =
-      op.getIndex().getType().cast<FIRRTLBaseType>().dyn_cast<UIntType>();
-  if (!uintType || uintType.getBitWidthOrSentinel() != 1)
+  auto uintType = op.getIndex().getType();
+  if (uintType.getBitWidthOrSentinel() != 1)
     return failure();
 
   // multibit_mux(index, {lhs, rhs}) -> mux(index, lhs, rhs)
@@ -1484,7 +1606,7 @@ StrictConnectOp firrtl::getSingleConnectUserOf(Value value) {
 
     if (auto aConnect = dyn_cast<StrictConnectOp>(user))
       if (aConnect.getDest() == value) {
-        if (!connect)
+        if (!connect || connect == aConnect)
           connect = aConnect;
         else
           return {};
@@ -1513,7 +1635,7 @@ static LogicalResult canonicalizeSingleSetConnect(StrictConnectOp op,
   if (getSingleConnectUserOf(op.getDest()) != op)
     return failure();
 
-  // Only foward if there is more than one use
+  // Only forward if there is more than one use
   if (connectedDecl->hasOneUse())
     return failure();
 
@@ -1690,6 +1812,17 @@ struct NodeBypass : public mlir::RewritePattern {
 };
 } // namespace
 
+// Interesting names and symbols and don't touch force nodes to stick around.
+OpFoldResult NodeOp::fold(FoldAdaptor adaptor) {
+  if (!hasDroppableName())
+    return {};
+  if (hasDontTouch(getResult())) // handles inner symbols
+    return {};
+  if (getAnnotationsAttr() && !getAnnotationsAttr().empty())
+    return {};
+  return adaptor.getInput();
+}
+
 void NodeOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                          MLIRContext *context) {
   results.insert<FoldNodeName>(context);
@@ -1811,15 +1944,15 @@ void SubindexOp::getCanonicalizationPatterns(RewritePatternSet &results,
   results.insert<SubindexAggOneShot>(context);
 }
 
-OpFoldResult SubindexOp::fold(ArrayRef<Attribute> operands) {
-  auto attr = operands[0].dyn_cast_or_null<ArrayAttr>();
+OpFoldResult SubindexOp::fold(FoldAdaptor adaptor) {
+  auto attr = adaptor.getInput().dyn_cast_or_null<ArrayAttr>();
   if (!attr)
     return {};
   return attr[getIndex()];
 }
 
-OpFoldResult SubfieldOp::fold(ArrayRef<Attribute> operands) {
-  auto attr = operands[0].dyn_cast_or_null<ArrayAttr>();
+OpFoldResult SubfieldOp::fold(FoldAdaptor adaptor) {
+  auto attr = adaptor.getInput().dyn_cast_or_null<ArrayAttr>();
   if (!attr)
     return {};
   auto index = getFieldIndex();
@@ -1839,12 +1972,37 @@ static Attribute collectFields(MLIRContext *context,
   return ArrayAttr::get(context, operands);
 }
 
-OpFoldResult BundleCreateOp::fold(ArrayRef<Attribute> operands) {
-  return collectFields(getContext(), operands);
+OpFoldResult BundleCreateOp::fold(FoldAdaptor adaptor) {
+  // bundle_create(%foo["a"], %foo["b"]) -> %foo when the type of %foo is
+  // bundle<a:..., b:...>.
+  if (SubfieldOp first = getOperand(0).getDefiningOp<SubfieldOp>())
+    if (first.getFieldIndex() == 0 && first.getInput().getType() == getType() &&
+        llvm::all_of(
+            llvm::drop_begin(llvm::enumerate(getOperands().drop_front())),
+            [&](auto elem) {
+              auto subindex = elem.value().template getDefiningOp<SubfieldOp>();
+              return subindex && subindex.getInput() == first.getInput() &&
+                     subindex.getFieldIndex() == elem.index();
+            }))
+      return first.getInput();
+
+  return collectFields(getContext(), adaptor.getOperands());
 }
 
-OpFoldResult VectorCreateOp::fold(ArrayRef<Attribute> operands) {
-  return collectFields(getContext(), operands);
+OpFoldResult VectorCreateOp::fold(FoldAdaptor adaptor) {
+  // vector_create(%foo[0], %foo[1]) -> %foo when the type of %foo is
+  // vector<..., 2>.
+  if (SubindexOp first = getOperand(0).getDefiningOp<SubindexOp>())
+    if (first.getIndex() == 0 && first.getInput().getType() == getType() &&
+        llvm::all_of(
+            llvm::drop_begin(llvm::enumerate(getOperands())), [&](auto elem) {
+              auto subindex = elem.value().template getDefiningOp<SubindexOp>();
+              return subindex && subindex.getInput() == first.getInput() &&
+                     subindex.getIndex() == elem.index();
+            }))
+      return first.getInput();
+
+  return collectFields(getContext(), adaptor.getOperands());
 }
 
 namespace {
@@ -1910,26 +2068,31 @@ void RegResetOp::getCanonicalizationPatterns(RewritePatternSet &results,
                  patterns::RegResetWithOneReset, FoldResetMux>(context);
 }
 
-// Returns true if the enable field of a port is set to false.
-static bool isPortDisabled(Value port) {
+// Returns the value connected to a port, if there is only one.
+static Value getPortFieldValue(Value port, StringRef name) {
   auto portTy = port.getType().cast<BundleType>();
-  auto enableIndex = portTy.getElementIndex("en");
-  assert(enableIndex && "missing enable flag on memory port");
+  auto fieldIndex = portTy.getElementIndex(name);
+  assert(fieldIndex && "missing field on memory port");
 
-  Value en = {};
+  Value value = {};
   for (auto *op : port.getUsers()) {
     auto portAccess = cast<SubfieldOp>(op);
-    if (enableIndex != portAccess.getFieldIndex())
+    if (fieldIndex != portAccess.getFieldIndex())
       continue;
     auto conn = getSingleConnectUserOf(portAccess);
-    if (!conn || en)
-      return false;
-    en = conn.getSrc();
+    if (!conn || value)
+      return {};
+    value = conn.getSrc();
   }
-  if (!en)
-    return false;
+  return value;
+}
 
-  auto portConst = en.getDefiningOp<ConstantOp>();
+// Returns true if the enable field of a port is set to false.
+static bool isPortDisabled(Value port) {
+  auto value = getPortFieldValue(port, "en");
+  if (!value)
+    return false;
+  auto portConst = value.getDefiningOp<ConstantOp>();
   if (!portConst)
     return false;
   return portConst.getValue().isZero();
@@ -1950,6 +2113,22 @@ static bool isPortUnused(Value port, StringRef data) {
   }
 
   return true;
+}
+
+// Returns the value connected to a port, if there is only one.
+static void replacePortField(PatternRewriter &rewriter, Value port,
+                             StringRef name, Value value) {
+  auto portTy = port.getType().cast<BundleType>();
+  auto fieldIndex = portTy.getElementIndex(name);
+  assert(fieldIndex && "missing field on memory port");
+
+  for (auto *op : llvm::make_early_inc_range(port.getUsers())) {
+    auto portAccess = cast<SubfieldOp>(op);
+    if (fieldIndex != portAccess.getFieldIndex())
+      continue;
+    rewriter.replaceAllUsesWith(portAccess, value);
+    rewriter.eraseOp(portAccess);
+  }
 }
 
 // Remove accesses to a port which is used.
@@ -2038,7 +2217,7 @@ struct FoldZeroWidthMemory : public mlir::RewritePattern {
   }
 };
 
-// If memory has no write ports, eliminate it.
+// If memory has no write ports and no file initialization, eliminate it.
 struct FoldReadOrWriteOnlyMemory : public mlir::RewritePattern {
   FoldReadOrWriteOnlyMemory(MLIRContext *context)
       : RewritePattern(MemOp::getOperationName(), 0, context) {}
@@ -2067,6 +2246,12 @@ struct FoldReadOrWriteOnlyMemory : public mlir::RewritePattern {
       llvm_unreachable("unknown port kind");
     }
     assert((!isWritten || !isRead) && "memory is in use");
+
+    // If the memory is read only, but has a file initialization, then we can't
+    // remove it.  A write only memory with file initialization is okay to
+    // remove.
+    if (isRead && mem.getInit())
+      return failure();
 
     for (auto port : mem.getResults())
       erasePort(rewriter, port);
@@ -2130,7 +2315,7 @@ struct FoldUnusedPorts : public mlir::RewritePattern {
           mem.getWriteLatency(), mem.getDepth(), mem.getRuw(),
           rewriter.getStrArrayAttr(portNames), mem.getName(), mem.getNameKind(),
           mem.getAnnotations(), rewriter.getArrayAttr(portAnnotations),
-          mem.getInnerSymAttr(), mem.getGroupIDAttr());
+          mem.getInnerSymAttr(), mem.getGroupIDAttr(), mem.getInitAttr());
 
     // Replace the dead ports with dummy wires.
     unsigned nextPort = 0;
@@ -2191,7 +2376,7 @@ struct FoldReadWritePorts : public mlir::RewritePattern {
         mem.getDepth(), mem.getRuw(), rewriter.getStrArrayAttr(portNames),
         mem.getName(), mem.getNameKind(), mem.getAnnotations(),
         rewriter.getArrayAttr(portAnnotations), mem.getInnerSymAttr(),
-        mem.getGroupIDAttr());
+        mem.getGroupIDAttr(), mem.getInitAttr());
 
     for (unsigned i = 0, n = mem.getNumResults(); i < n; ++i) {
       auto result = mem.getResult(i);
@@ -2224,12 +2409,410 @@ struct FoldReadWritePorts : public mlir::RewritePattern {
     return success();
   }
 };
+
+// Eliminate the dead ports of memories.
+struct FoldUnusedBits : public mlir::RewritePattern {
+  FoldUnusedBits(MLIRContext *context)
+      : RewritePattern(MemOp::getOperationName(), 0, context) {}
+
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    MemOp mem = cast<MemOp>(op);
+    if (hasDontTouch(mem))
+      return failure();
+
+    // Only apply the transformation if the memory is not sequential.
+    const auto &summary = mem.getSummary();
+    if (summary.isMasked || summary.isSeqMem())
+      return failure();
+
+    auto type = mem.getDataType().dyn_cast<IntType>();
+    if (!type)
+      return failure();
+    auto width = type.getBitWidthOrSentinel();
+    if (width <= 0)
+      return failure();
+
+    llvm::SmallBitVector usedBits(width);
+    DenseMap<unsigned, unsigned> mapping;
+
+    // Find which bits are used out of the users of a read port. This detects
+    // ports whose data/rdata field is used only through bit select ops. The
+    // bit selects are then used to build a bit-mask. The ops are collected.
+    SmallVector<BitsPrimOp> readOps;
+    auto findReadUsers = [&](Value port, StringRef field) {
+      auto portTy = port.getType().cast<BundleType>();
+      auto fieldIndex = portTy.getElementIndex(field);
+      assert(fieldIndex && "missing data port");
+
+      for (auto *op : port.getUsers()) {
+        auto portAccess = cast<SubfieldOp>(op);
+        if (fieldIndex != portAccess.getFieldIndex())
+          continue;
+
+        for (auto *user : op->getUsers()) {
+          auto bits = dyn_cast<BitsPrimOp>(user);
+          if (!bits) {
+            usedBits.set();
+            continue;
+          }
+
+          usedBits.set(bits.getLo(), bits.getHi() + 1);
+          mapping[bits.getLo()] = 0;
+          readOps.push_back(bits);
+        }
+      }
+    };
+
+    // Finds the users of write ports. This expects all the data/wdata fields
+    // of the ports to be used solely as the destination of strict connects.
+    // If a memory has ports with other uses, it is excluded from optimisation.
+    SmallVector<StrictConnectOp> writeOps;
+    auto findWriteUsers = [&](Value port, StringRef field) -> LogicalResult {
+      auto portTy = port.getType().cast<BundleType>();
+      auto fieldIndex = portTy.getElementIndex(field);
+      assert(fieldIndex && "missing data port");
+
+      for (auto *op : port.getUsers()) {
+        auto portAccess = cast<SubfieldOp>(op);
+        if (fieldIndex != portAccess.getFieldIndex())
+          continue;
+
+        auto conn = getSingleConnectUserOf(portAccess);
+        if (!conn)
+          return failure();
+
+        writeOps.push_back(conn);
+      }
+      return success();
+    };
+
+    // Traverse all ports and find the read and used data fields.
+    for (auto [i, port] : llvm::enumerate(mem.getResults())) {
+      // Do not simplify annotated ports.
+      if (!mem.getPortAnnotation(i).empty())
+        return failure();
+
+      switch (mem.getPortKind(i)) {
+      case MemOp::PortKind::Debug:
+        // Skip debug ports.
+        return failure();
+      case MemOp::PortKind::Write:
+        if (failed(findWriteUsers(port, "data")))
+          return failure();
+        continue;
+      case MemOp::PortKind::Read:
+        findReadUsers(port, "data");
+        continue;
+      case MemOp::PortKind::ReadWrite:
+        if (failed(findWriteUsers(port, "wdata")))
+          return failure();
+        findReadUsers(port, "rdata");
+        continue;
+      }
+      llvm_unreachable("unknown port kind");
+    }
+
+    // Perform the transformation is there are some bits missing. Unused
+    // memories are handled in a different canonicalizer.
+    if (usedBits.all() || usedBits.none())
+      return failure();
+
+    // Build a mapping of existing indices to compacted ones.
+    SmallVector<std::pair<unsigned, unsigned>> ranges;
+    unsigned newWidth = 0;
+    for (int i = usedBits.find_first(); 0 <= i && i < width;) {
+      int e = usedBits.find_next_unset(i);
+      if (e < 0)
+        e = width;
+      for (int idx = i; idx < e; ++idx, ++newWidth) {
+        if (auto it = mapping.find(idx); it != mapping.end()) {
+          it->second = newWidth;
+        }
+      }
+      ranges.emplace_back(i, e - 1);
+      i = e != width ? usedBits.find_next(e) : e;
+    }
+
+    // Create the new op with the new port types.
+    auto newType = IntType::get(op->getContext(), type.isSigned(), newWidth);
+    SmallVector<Type> portTypes;
+    for (auto [i, port] : llvm::enumerate(mem.getResults())) {
+      portTypes.push_back(
+          MemOp::getTypeForPort(mem.getDepth(), newType, mem.getPortKind(i)));
+    }
+    auto newMem = rewriter.replaceOpWithNewOp<MemOp>(
+        mem, portTypes, mem.getReadLatency(), mem.getWriteLatency(),
+        mem.getDepth(), mem.getRuw(), mem.getPortNames(), mem.getName(),
+        mem.getNameKind(), mem.getAnnotations(), mem.getPortAnnotations(),
+        mem.getInnerSymAttr(), mem.getGroupIDAttr(), mem.getInitAttr());
+
+    // Rewrite bundle users to the new data type.
+    auto rewriteSubfield = [&](Value port, StringRef field) {
+      auto portTy = port.getType().cast<BundleType>();
+      auto fieldIndex = portTy.getElementIndex(field);
+      assert(fieldIndex && "missing data port");
+
+      rewriter.setInsertionPointAfter(newMem);
+      auto newPortAccess =
+          rewriter.create<SubfieldOp>(port.getLoc(), port, field);
+
+      for (auto *op : llvm::make_early_inc_range(port.getUsers())) {
+        auto portAccess = cast<SubfieldOp>(op);
+        if (op == newPortAccess || fieldIndex != portAccess.getFieldIndex())
+          continue;
+        rewriter.replaceOp(portAccess, newPortAccess.getResult());
+      }
+    };
+
+    // Rewrite the field accesses.
+    for (auto [i, port] : llvm::enumerate(newMem.getResults())) {
+      switch (newMem.getPortKind(i)) {
+      case MemOp::PortKind::Debug:
+        llvm_unreachable("cannot rewrite debug port");
+      case MemOp::PortKind::Write:
+        rewriteSubfield(port, "data");
+        continue;
+      case MemOp::PortKind::Read:
+        rewriteSubfield(port, "data");
+        continue;
+      case MemOp::PortKind::ReadWrite:
+        rewriteSubfield(port, "rdata");
+        rewriteSubfield(port, "wdata");
+        continue;
+      }
+      llvm_unreachable("unknown port kind");
+    }
+
+    // Rewrite the reads to the new ranges, compacting them.
+    for (auto readOp : readOps) {
+      rewriter.setInsertionPointAfter(readOp);
+      auto it = mapping.find(readOp.getLo());
+      assert(it != mapping.end() && "bit op mapping not found");
+      rewriter.replaceOpWithNewOp<BitsPrimOp>(
+          readOp, readOp.getInput(),
+          readOp.getHi() - readOp.getLo() + it->second, it->second);
+    }
+
+    // Rewrite the writes into a concatenation of slices.
+    for (auto writeOp : writeOps) {
+      Value source = writeOp.getSrc();
+      rewriter.setInsertionPoint(writeOp);
+
+      Value catOfSlices;
+      for (auto &[start, end] : ranges) {
+        Value slice =
+            rewriter.create<BitsPrimOp>(writeOp.getLoc(), source, end, start);
+        if (catOfSlices) {
+          catOfSlices =
+              rewriter.create<CatPrimOp>(writeOp.getLoc(), slice, catOfSlices);
+        } else {
+          catOfSlices = slice;
+        }
+      }
+      rewriter.replaceOpWithNewOp<StrictConnectOp>(writeOp, writeOp.getDest(),
+                                                   catOfSlices);
+    }
+
+    return success();
+  }
+};
+
+// Rewrite single-address memories to a firrtl register.
+struct FoldRegMems : public mlir::RewritePattern {
+  FoldRegMems(MLIRContext *context)
+      : RewritePattern(MemOp::getOperationName(), 0, context) {}
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    MemOp mem = cast<MemOp>(op);
+    const FirMemory &info = mem.getSummary();
+    if (hasDontTouch(mem) || info.depth != 1)
+      return failure();
+
+    auto memModule = mem->getParentOfType<FModuleOp>();
+
+    // Find the clock of the register-to-be, all write ports should share it.
+    Value clock;
+    SmallPtrSet<Operation *, 8> connects;
+    SmallVector<SubfieldOp> portAccesses;
+    for (auto [i, port] : llvm::enumerate(mem.getResults())) {
+      if (!mem.getPortAnnotation(i).empty())
+        continue;
+
+      auto collect = [&, port = port](ArrayRef<StringRef> fields) {
+        auto portTy = port.getType().cast<BundleType>();
+        for (auto field : fields) {
+          auto fieldIndex = portTy.getElementIndex(field);
+          assert(fieldIndex && "missing field on memory port");
+
+          for (auto *op : port.getUsers()) {
+            auto portAccess = cast<SubfieldOp>(op);
+            if (fieldIndex != portAccess.getFieldIndex())
+              continue;
+            portAccesses.push_back(portAccess);
+            for (auto *user : portAccess->getUsers()) {
+              auto conn = dyn_cast<FConnectLike>(user);
+              if (!conn)
+                return failure();
+              connects.insert(conn);
+            }
+          }
+        }
+        return success();
+      };
+
+      switch (mem.getPortKind(i)) {
+      case MemOp::PortKind::Debug:
+        return failure();
+      case MemOp::PortKind::Read:
+        if (failed(collect({"clk", "en", "addr"})))
+          return failure();
+        continue;
+      case MemOp::PortKind::Write:
+        if (failed(collect({"clk", "en", "addr", "data", "mask"})))
+          return failure();
+        break;
+      case MemOp::PortKind::ReadWrite:
+        if (failed(collect({"clk", "en", "addr", "wmode", "wdata", "wmask"})))
+          return failure();
+        break;
+      }
+
+      Value portClock = getPortFieldValue(port, "clk");
+      if (!portClock || (clock && portClock != clock))
+        return failure();
+      clock = portClock;
+    }
+
+    // Create a new register to store the data.
+    auto ty = mem.getDataType();
+    rewriter.setInsertionPointAfterValue(clock);
+    auto reg = rewriter.create<RegOp>(mem.getLoc(), ty, clock, mem.getName());
+
+    // Helper to insert a given number of pipeline stages through registers.
+    auto pipeline = [&](Value value, Value clock, const Twine &name,
+                        unsigned latency) {
+      for (unsigned i = 0; i < latency; ++i) {
+        std::string regName;
+        {
+          llvm::raw_string_ostream os(regName);
+          os << mem.getName() << "_" << name << "_" << i;
+        }
+
+        auto reg = rewriter.create<RegOp>(mem.getLoc(), value.getType(), clock,
+                                          rewriter.getStringAttr(regName));
+        rewriter.create<StrictConnectOp>(value.getLoc(), reg, value);
+        value = reg;
+      }
+      return value;
+    };
+
+    const unsigned writeStages = info.writeLatency - 1;
+
+    // Traverse each port. Replace reads with the pipelined register, discarding
+    // the enable flag and reading unconditionally. Pipeline the mask, enable
+    // and data bits of all write ports to be arbitrated and wired to the reg.
+    SmallVector<std::tuple<Value, Value, Value>> writes;
+    for (auto [i, port] : llvm::enumerate(mem.getResults())) {
+      Value portClock = getPortFieldValue(port, "clk");
+      StringRef name = mem.getPortName(i);
+
+      auto portPipeline = [&, port = port](StringRef field, unsigned stages) {
+        Value value = getPortFieldValue(port, field);
+        assert(value);
+        rewriter.setInsertionPointAfterValue(value);
+        return pipeline(value, portClock, name + "_" + field, stages);
+      };
+
+      switch (mem.getPortKind(i)) {
+      case MemOp::PortKind::Debug:
+        llvm_unreachable("unknown port kind");
+      case MemOp::PortKind::Read: {
+        // Read ports pipeline the addr and enable signals. However, the
+        // address must be 0 for single-address memories and the enable signal
+        // is ignored, always reading out the register. Under these constraints,
+        // the read port can be replaced with the value from the register.
+        rewriter.setInsertionPointAfterValue(reg);
+        replacePortField(rewriter, port, "data", reg);
+        break;
+      }
+      case MemOp::PortKind::Write: {
+        auto data = portPipeline("data", writeStages);
+        auto en = portPipeline("en", writeStages);
+        auto mask = portPipeline("mask", writeStages);
+        writes.emplace_back(data, en, mask);
+        break;
+      }
+      case MemOp::PortKind::ReadWrite: {
+        // Always read the register into the read end.
+        rewriter.setInsertionPointAfterValue(reg);
+        replacePortField(rewriter, port, "rdata", reg);
+
+        // Create a write enable and pipeline stages.
+        auto wdata = portPipeline("wdata", writeStages);
+        auto wmask = portPipeline("wmask", writeStages);
+
+        Value en = getPortFieldValue(port, "en");
+        Value wmode = getPortFieldValue(port, "wmode");
+        rewriter.setInsertionPointToEnd(memModule.getBodyBlock());
+
+        auto wen = rewriter.create<AndPrimOp>(port.getLoc(), en, wmode);
+        auto wenPipelined =
+            pipeline(wen, portClock, name + "_wen", writeStages);
+        writes.emplace_back(wdata, wenPipelined, wmask);
+        break;
+      }
+      }
+    }
+
+    // Regardless of `writeUnderWrite`, always implement PortOrder.
+    rewriter.setInsertionPointToEnd(memModule.getBodyBlock());
+    Value next = reg;
+    for (auto &[data, en, mask] : writes) {
+      Value masked;
+
+      // If a mask bit is used, emit muxes to select the input from the
+      // register (no mask) or the input (mask bit set).
+      Location loc = mem.getLoc();
+      unsigned maskGran = info.dataWidth / info.maskBits;
+      for (unsigned i = 0; i < info.maskBits; ++i) {
+        unsigned hi = (i + 1) * maskGran - 1;
+        unsigned lo = i * maskGran;
+
+        auto dataPart = rewriter.createOrFold<BitsPrimOp>(loc, data, hi, lo);
+        auto nextPart = rewriter.createOrFold<BitsPrimOp>(loc, next, hi, lo);
+        auto bit = rewriter.createOrFold<BitsPrimOp>(loc, mask, i, i);
+        auto chunk = rewriter.create<MuxPrimOp>(loc, bit, dataPart, nextPart);
+
+        if (masked) {
+          masked = rewriter.create<CatPrimOp>(loc, chunk, masked);
+        } else {
+          masked = chunk;
+        }
+      }
+
+      next = rewriter.create<MuxPrimOp>(next.getLoc(), en, masked, next);
+    }
+    rewriter.create<StrictConnectOp>(reg.getLoc(), reg, next);
+
+    // Delete the fields and their associated connects.
+    for (Operation *conn : connects)
+      rewriter.eraseOp(conn);
+    for (auto portAccess : portAccesses)
+      rewriter.eraseOp(portAccess);
+    rewriter.eraseOp(mem);
+
+    return success();
+  }
+};
 } // namespace
 
 void MemOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.insert<FoldZeroWidthMemory, FoldReadOrWriteOnlyMemory,
-                 FoldReadWritePorts, FoldUnusedPorts>(context);
+  results
+      .insert<FoldZeroWidthMemory, FoldReadOrWriteOnlyMemory,
+              FoldReadWritePorts, FoldUnusedPorts, FoldUnusedBits, FoldRegMems>(
+          context);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2360,4 +2943,18 @@ void AssumeOp::getCanonicalizationPatterns(RewritePatternSet &results,
 void CoverOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                           MLIRContext *context) {
   results.add(canonicalizeImmediateVerifOp<CoverOp, /* EraseIfZero = */ true>);
+}
+
+//===----------------------------------------------------------------------===//
+// InvalidValueOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult InvalidValueOp::canonicalize(InvalidValueOp op,
+                                           PatternRewriter &rewriter) {
+  // Remove `InvalidValueOp`s with no uses.
+  if (op.use_empty()) {
+    rewriter.eraseOp(op);
+    return success();
+  }
+  return failure();
 }

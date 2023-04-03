@@ -10,9 +10,19 @@
 //
 //===----------------------------------------------------------------------===//
 
-def HasCustomSSAName : DeclareOpInterfaceMethods<OpAsmOpInterface,
-                         ["getAsmResultNames"]>;
+#ifndef CIRCT_DIALECT_FIRRTL_FIRRTLDECLARATIONS_TD
+#define CIRCT_DIALECT_FIRRTL_FIRRTLDECLARATIONS_TD
 
+include "FIRRTLAttributes.td"
+include "FIRRTLDialect.td"
+include "FIRRTLEnums.td"
+include "FIRRTLOpInterfaces.td"
+include "FIRRTLTypes.td"
+include "circt/Dialect/HW/HWOpInterfaces.td"
+include "circt/Dialect/HW/HWTypes.td"
+include "mlir/IR/OpBase.td"
+include "mlir/IR/SymbolInterfaces.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
 
 class ReferableDeclOp<string mnemonic, list<Trait> traits = []> :
   FIRRTLOp<mnemonic, traits # [HasCustomSSAName, InnerSymbol, FNamableOp]> {
@@ -20,7 +30,7 @@ class ReferableDeclOp<string mnemonic, list<Trait> traits = []> :
 }
 
 def InstanceOp : ReferableDeclOp<"instance", [HasParent<"firrtl::FModuleOp, firrtl::WhenOp">,
-    DeclareOpInterfaceMethods<SymbolUserOpInterface>, 
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>,
     DeclareOpInterfaceMethods<HWInstanceLike, ["instanceName", "instanceNameAttr"]>]> {
   let summary = "Instantiate an instance of a module";
   let description = [{
@@ -120,12 +130,13 @@ def MemOp : ReferableDeclOp<"mem"> {
          AnnotationArrayAttr:$annotations,
          PortAnnotationsAttr:$portAnnotations,
          OptionalAttr<InnerSymAttr>:$inner_sym,
-         OptionalAttr<UI32Attr>:$groupID);
+         OptionalAttr<UI32Attr>:$groupID,
+         OptionalAttr<MemoryInitAttr>:$init);
   let results = (outs Variadic<FIRRTLType>:$results);
 
   let assemblyFormat = [{
-    (`sym` $inner_sym^)? custom<NameKind>($nameKind)
-    $ruw custom<MemOp>(attr-dict) `:` qualified(type($results))
+    (`sym` $inner_sym^)? `` custom<NameKind>($nameKind)
+    $ruw `` custom<MemOp>(attr-dict) `:` qualified(type($results))
   }];
 
   let builders = [
@@ -244,11 +255,12 @@ def NodeOp : ReferableDeclOp<"node",
   ];
 
   let assemblyFormat = [{
-    (`sym` $inner_sym^)? custom<NameKind>($nameKind)
-    $input custom<ImplicitSSAName>(attr-dict) `:` qualified(type($input))
+    (`sym` $inner_sym^)? `` custom<NameKind>($nameKind)
+    $input `` custom<FIRRTLImplicitSSAName>(attr-dict) `:` qualified(type($input))
   }];
 
   let hasCanonicalizer = true;
+  let hasFolder = 1;
 }
 
 def RegOp : ReferableDeclOp<"reg"> {
@@ -257,7 +269,7 @@ def RegOp : ReferableDeclOp<"reg"> {
     Declare a new register:
 
     ```
-    %name = firrtl.reg %clockVal : t1
+    %name = firrtl.reg %clockVal : !firrtl.clock, t1
     ```
     }];
 
@@ -287,8 +299,8 @@ def RegOp : ReferableDeclOp<"reg"> {
   ];
 
   let assemblyFormat = [{
-    (`sym` $inner_sym^)? custom<NameKind>($nameKind)
-    operands custom<ImplicitSSAName>(attr-dict) `:` qualified(type($result))
+    (`sym` $inner_sym^)? `` custom<NameKind>($nameKind)
+    operands `` custom<FIRRTLImplicitSSAName>(attr-dict) `:` type($clockVal) `,` qualified(type($result))
   }];
   let hasCanonicalizeMethod = true;
 }
@@ -298,7 +310,7 @@ def RegResetOp : ReferableDeclOp<"regreset"> {
   let description = [{
     Declare a new register:
     ```
-      %name = firrtl.regreset %clockVal, %resetSignal, %resetValue : t1
+      %name = firrtl.regreset %clockVal, %resetSignal, %resetValue : !firrtl.clock, t1
     ```
     }];
 
@@ -333,9 +345,9 @@ def RegResetOp : ReferableDeclOp<"regreset"> {
   ];
 
   let assemblyFormat = [{
-    (`sym` $inner_sym^)? custom<NameKind>($nameKind)
-    operands custom<ImplicitSSAName>(attr-dict)
-    `:` qualified(type($resetSignal)) `,` qualified(type($resetValue)) `,` qualified(type($result))
+    (`sym` $inner_sym^)? `` custom<NameKind>($nameKind)
+    operands `` custom<FIRRTLImplicitSSAName>(attr-dict)
+    `:` type($clockVal) `,` qualified(type($resetSignal)) `,` qualified(type($resetValue)) `,` qualified(type($result))
   }];
 
   let hasCanonicalizer = true;
@@ -377,7 +389,10 @@ def WireOp : ReferableDeclOp<"wire"> {
   ];
 
   let assemblyFormat = [{
-    (`sym` $inner_sym^)? custom<NameKind>($nameKind)
-    custom<ImplicitSSAName>(attr-dict) `:` qualified(type($result))
+    (`sym` $inner_sym^)? `` custom<NameKind>($nameKind) ``
+    custom<FIRRTLImplicitSSAName>(attr-dict) `:`
+    qualified(type($result))
   }];
 }
+
+#endif // CIRCT_DIALECT_FIRRTL_FIRRTLDECLARATIONS_TD

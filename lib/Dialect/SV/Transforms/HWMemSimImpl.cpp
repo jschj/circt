@@ -15,10 +15,12 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/HW/HWSymCache.h"
 #include "circt/Dialect/HW/Namespace.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Path.h"
 
 using namespace circt;
 using namespace hw;
@@ -40,6 +42,9 @@ struct FirMemory {
   size_t readUnderWrite;
   WUW writeUnderWrite;
   SmallVector<int32_t> writeClockIDs;
+  StringRef initFilename;
+  bool initIsBinary;
+  bool initIsInline;
 };
 } // end anonymous namespace
 
@@ -47,7 +52,7 @@ namespace {
 
 class HWMemSimImpl {
   bool ignoreReadEnableMem;
-  bool stripMuxPragmas;
+  bool addMuxPragmas;
   bool disableMemRandomization;
   bool disableRegRandomization;
   bool addVivadoRAMAddressConflictSynthesisBugWorkaround;
@@ -60,15 +65,18 @@ class HWMemSimImpl {
   sv::AlwaysOp lastPipelineAlwaysOp;
 
 public:
-  HWMemSimImpl(bool ignoreReadEnableMem, bool stripMuxPragmas,
+  Namespace &mlirModuleNamespace;
+
+  HWMemSimImpl(bool ignoreReadEnableMem, bool addMuxPragmas,
                bool disableMemRandomization, bool disableRegRandomization,
-               bool addVivadoRAMAddressConflictSynthesisBugWorkaround)
-      : ignoreReadEnableMem(ignoreReadEnableMem),
-        stripMuxPragmas(stripMuxPragmas),
+               bool addVivadoRAMAddressConflictSynthesisBugWorkaround,
+               Namespace &mlirModuleNamespace)
+      : ignoreReadEnableMem(ignoreReadEnableMem), addMuxPragmas(addMuxPragmas),
         disableMemRandomization(disableMemRandomization),
         disableRegRandomization(disableRegRandomization),
         addVivadoRAMAddressConflictSynthesisBugWorkaround(
-            addVivadoRAMAddressConflictSynthesisBugWorkaround) {}
+            addVivadoRAMAddressConflictSynthesisBugWorkaround),
+        mlirModuleNamespace(mlirModuleNamespace) {}
 
   void generateMemory(HWModuleOp op, FirMemory mem);
 };
@@ -78,7 +86,7 @@ struct HWMemSimImplPass : public sv::HWMemSimImplBase<HWMemSimImplPass> {
 
   using sv::HWMemSimImplBase<HWMemSimImplPass>::ignoreReadEnableMem;
   using sv::HWMemSimImplBase<HWMemSimImplPass>::replSeqMem;
-  using sv::HWMemSimImplBase<HWMemSimImplPass>::stripMuxPragmas;
+  using sv::HWMemSimImplBase<HWMemSimImplPass>::addMuxPragmas;
   using sv::HWMemSimImplBase<HWMemSimImplPass>::disableMemRandomization;
   using sv::HWMemSimImplBase<HWMemSimImplPass>::disableRegRandomization;
   using sv::HWMemSimImplBase<
@@ -109,6 +117,9 @@ static FirMemory analyzeMemOp(HWModuleGeneratedOp op) {
     for (auto clockID : clockIDsAttr)
       mem.writeClockIDs.push_back(
           clockID.cast<IntegerAttr>().getValue().getZExtValue());
+  mem.initFilename = op->getAttrOfType<StringAttr>("initFilename").getValue();
+  mem.initIsBinary = op->getAttrOfType<BoolAttr>("initIsBinary").getValue();
+  mem.initIsInline = op->getAttrOfType<BoolAttr>("initIsInline").getValue();
   return mem;
 }
 
@@ -133,28 +144,28 @@ static bool valueDefinedBeforeOp(Value value, Operation *op) {
 //   /* synopsys infer_mux_override */
 //   assign GEN = memory[addr] /* cadence map_to_mux */;
 // ```
-// If `stripMuxPragmas` is enabled, just return the read value without
+// If `addMuxPragmas` is enabled, just return the read value without
 // annotations.
 static Value getMemoryRead(ImplicitLocOpBuilder &b, Value memory, Value addr,
-                           bool stripMuxPragmas) {
+                           bool addMuxPragmas) {
   auto slot =
       b.create<sv::ReadInOutOp>(b.create<sv::ArrayIndexInOutOp>(memory, addr));
   // If we don't want to add mux pragmas, just return the read value.
-  if (stripMuxPragmas || memory.getType()
-                                 .cast<hw::InOutType>()
-                                 .getElementType()
-                                 .cast<hw::UnpackedArrayType>()
-                                 .getSize() <= 1)
+  if (!addMuxPragmas || memory.getType()
+                                .cast<hw::InOutType>()
+                                .getElementType()
+                                .cast<hw::UnpackedArrayType>()
+                                .getSize() <= 1)
     return slot;
   circt::sv::setSVAttributes(
-      slot, sv::SVAttributesAttr::get(b.getContext(), {"cadence map_to_mux"},
-                                      /*emitAsComments=*/true));
+      slot, sv::SVAttributeAttr::get(b.getContext(), "cadence map_to_mux",
+                                     /*emitAsComment=*/true));
   auto valWire = b.create<sv::WireOp>(slot.getType());
   auto assignOp = b.create<sv::AssignOp>(valWire, slot);
   sv::setSVAttributes(assignOp,
-                      sv::SVAttributesAttr::get(b.getContext(),
-                                                {"synopsys infer_mux_override"},
-                                                /*emitAsComments=*/true));
+                      sv::SVAttributeAttr::get(b.getContext(),
+                                               "synopsys infer_mux_override",
+                                               /*emitAsComment=*/true));
 
   return b.create<sv::ReadInOutOp>(valWire);
 }
@@ -222,20 +233,35 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
   // Each mask bit controls mask-granularity number of data bits.
   auto dataType = b.getIntegerType(mem.dataWidth);
 
+  // Count the total number of ports.
+  unsigned numPorts =
+      mem.numReadPorts + mem.numWritePorts + mem.numReadWritePorts;
+
   // Create registers for the memory.
   sv::RegOp reg = b.create<sv::RegOp>(
       UnpackedArrayType::get(dataType, mem.depth), b.getStringAttr("Memory"));
 
-  // If the read latency is zero, we regard the memory as write-first.
-  // We add a SV attribute to specify a ram style to use LUTs for Vivado to
-  // avoid a bug that miscompiles the write-first memory. See "RAM address
-  // conflict and Vivado synthesis bug" issue in the vivado forum for the more
-  // detail.
-  if (addVivadoRAMAddressConflictSynthesisBugWorkaround && mem.readLatency == 0)
-    circt::sv::setSVAttributes(
-        reg,
-        sv::SVAttributesAttr::get(
-            b.getContext(), {std::make_pair("ram_style", R"("distributed")")}));
+  if (addVivadoRAMAddressConflictSynthesisBugWorkaround) {
+    if (mem.readLatency == 0) {
+      // If the read latency is zero, we regard the memory as write-first.
+      // We add a SV attribute to specify a ram style to use LUTs for Vivado
+      // to avoid a bug that miscompiles the write-first memory. See "RAM
+      // address conflict and Vivado synthesis bug" issue in the vivado forum
+      // for the more detail.
+      circt::sv::setSVAttributes(
+          reg, sv::SVAttributeAttr::get(b.getContext(), "ram_style",
+                                        R"("distributed")",
+                                        /*emitAsComment=*/false));
+    } else if (mem.readLatency == 1 && numPorts > 1) {
+      // If the read address is registered and the RAM has multiple ports,
+      // force write-first behaviour by setting rw_addr_collision. This avoids
+      // unpredictable behaviour. Downstreams flows should watch for `VPL
+      // 8-6430`.
+      circt::sv::setSVAttributes(
+          reg, sv::SVAttributeAttr::get(b.getContext(), "rw_addr_collision",
+                                        R"("yes")", /*emitAsComment=*/false));
+    }
+  }
 
   SmallVector<Value, 4> outputs;
 
@@ -259,7 +285,7 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
     }
 
     // Read Logic
-    Value rdata = getMemoryRead(b, reg, addr, stripMuxPragmas);
+    Value rdata = getMemoryRead(b, reg, addr, addMuxPragmas);
     if (!ignoreReadEnableMem) {
       Value x = b.create<sv::ConstantXOp>(rdata.getType());
       rdata = b.create<comb::MuxOp>(en, rdata, x, false);
@@ -334,7 +360,7 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
             b.createOrFold<ConstantOp>(read_wmode.getType(), 0), false),
         false);
 
-    auto val = getMemoryRead(b, reg, read_addr, stripMuxPragmas);
+    auto val = getMemoryRead(b, reg, read_addr, addMuxPragmas);
     Value x = b.create<sv::ConstantXOp>(val.getType());
     b.create<sv::AssignOp>(rWire, b.create<comb::MuxOp>(rcond, val, x, false));
 
@@ -442,6 +468,74 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
   auto *outputOp = op.getBodyBlock()->getTerminator();
   outputOp->setOperands(outputs);
 
+  // Add logic to initialize the memory based on a file emission request.  This
+  // disables randomization.
+  if (!mem.initFilename.empty()) {
+    // Set an inner symbol on the register if one does not exist.
+    if (!reg.getInnerSymAttr())
+      reg.setInnerSymAttr(
+          b.getStringAttr(moduleNamespace.newName(reg.getName())));
+
+    if (mem.initIsInline) {
+      b.create<sv::IfDefOp>("SYNTHESIS", std::function<void()>(), [&]() {
+        b.create<sv::InitialOp>([&]() {
+          b.create<sv::ReadMemOp>(reg, mem.initFilename,
+                                  mem.initIsBinary
+                                      ? MemBaseTypeAttr::MemBaseBin
+                                      : MemBaseTypeAttr::MemBaseHex);
+        });
+      });
+    } else {
+      OpBuilder::InsertionGuard guard(b);
+
+      // Create a new module with the readmem op.
+      b.setInsertionPointAfter(op);
+      auto boundModule = b.create<HWModuleOp>(
+          b.getStringAttr(mlirModuleNamespace.newName(op.getName() + "_init")),
+          ArrayRef<PortInfo>());
+
+      auto filename = op->getAttrOfType<OutputFileAttr>("output_file");
+      if (filename) {
+        if (!filename.isDirectory()) {
+          SmallString<128> dir(filename.getFilename().getValue());
+          llvm::sys::path::remove_filename(dir);
+          filename = hw::OutputFileAttr::getFromDirectoryAndFilename(
+              b.getContext(), dir, boundModule.getName() + ".sv");
+        }
+      } else {
+        filename = hw::OutputFileAttr::getFromFilename(
+            b.getContext(), boundModule.getName() + ".sv");
+      }
+
+      boundModule->setAttr("output_file", filename);
+      b.setInsertionPointToStart(op.getBodyBlock());
+      b.setInsertionPointToStart(boundModule.getBodyBlock());
+      b.create<sv::InitialOp>([&]() {
+        auto xmr = b.create<sv::XMRRefOp>(
+            reg.getType(),
+            hw::InnerRefAttr::get(op.getNameAttr(), reg.getInnerSymAttr()));
+        b.create<sv::ReadMemOp>(xmr, mem.initFilename,
+                                mem.initIsBinary ? MemBaseTypeAttr::MemBaseBin
+                                                 : MemBaseTypeAttr::MemBaseHex);
+      });
+
+      // Instantiate this new module inside the memory module.
+      b.setInsertionPointAfter(reg);
+      auto boundInstance = b.create<hw::InstanceOp>(
+          boundModule, boundModule.getName(), ArrayRef<Value>());
+      boundInstance->setAttr("inner_sym",
+                             b.getStringAttr(moduleNamespace.newName(
+                                 boundInstance.getName().getValue())));
+      boundInstance->setAttr("doNotPrint", b.getBoolAttr(true));
+
+      // Bind the new module.
+      b.setInsertionPointAfter(boundModule);
+      auto bind = b.create<sv::BindOp>(hw::InnerRefAttr::get(
+          op.getNameAttr(), boundInstance.getInnerSymAttr()));
+      bind->setAttr("output_file", filename);
+    }
+  }
+
   // Add logic to initialize the memory and any internal registers to random
   // values.
   if (disableMemRandomization && disableRegRandomization)
@@ -454,7 +548,7 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
     StringRef initvar;
 
     // Declare variables for use by memory randomization logic.
-    if (!disableMemRandomization) {
+    if (!disableMemRandomization || !mem.initFilename.empty()) {
       b.create<sv::IfDefOp>("RANDOMIZE_MEM_INIT", [&]() {
         initvar = moduleNamespace.newName("initvar");
         b.create<sv::VerbatimOp>("integer " + Twine(initvar) + ";\n");
@@ -589,13 +683,21 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
 }
 
 void HWMemSimImplPass::runOnOperation() {
-  auto topModule = getOperation().getBody();
+  auto topModule = getOperation();
+
+  // Populate a namespace from the symbols visible to the top-level MLIR module.
+  // Memories with initializations create modules and these need to be legal
+  // symbols.
+  SymbolCache symbolCache;
+  symbolCache.addDefinitions(topModule);
+  Namespace mlirModuleNamespace;
+  mlirModuleNamespace.add(symbolCache);
 
   SmallVector<HWModuleGeneratedOp> toErase;
   bool anythingChanged = false;
 
   for (auto op :
-       llvm::make_early_inc_range(topModule->getOps<HWModuleGeneratedOp>())) {
+       llvm::make_early_inc_range(topModule.getOps<HWModuleGeneratedOp>())) {
     auto oldModule = cast<HWModuleGeneratedOp>(op);
     auto gen = oldModule.getGeneratorKind();
     auto genOp = cast<HWGeneratorSchemaOp>(
@@ -625,9 +727,10 @@ void HWMemSimImplPass::runOnOperation() {
         newModule.setCommentAttr(
             builder.getStringAttr("VCS coverage exclude_file"));
 
-        HWMemSimImpl(ignoreReadEnableMem, stripMuxPragmas,
+        HWMemSimImpl(ignoreReadEnableMem, addMuxPragmas,
                      disableMemRandomization, disableRegRandomization,
-                     addVivadoRAMAddressConflictSynthesisBugWorkaround)
+                     addVivadoRAMAddressConflictSynthesisBugWorkaround,
+                     mlirModuleNamespace)
             .generateMemory(newModule, mem);
       }
 
@@ -641,13 +744,13 @@ void HWMemSimImplPass::runOnOperation() {
 }
 
 std::unique_ptr<Pass> circt::sv::createHWMemSimImplPass(
-    bool replSeqMem, bool ignoreReadEnableMem, bool stripMuxPragmas,
+    bool replSeqMem, bool ignoreReadEnableMem, bool addMuxPragmas,
     bool disableMemRandomization, bool disableRegRandomization,
     bool addVivadoRAMAddressConflictSynthesisBugWorkaround) {
   auto pass = std::make_unique<HWMemSimImplPass>();
   pass->replSeqMem = replSeqMem;
   pass->ignoreReadEnableMem = ignoreReadEnableMem;
-  pass->stripMuxPragmas = stripMuxPragmas;
+  pass->addMuxPragmas = addMuxPragmas;
   pass->disableMemRandomization = disableMemRandomization;
   pass->disableRegRandomization = disableRegRandomization;
   pass->addVivadoRAMAddressConflictSynthesisBugWorkaround =
