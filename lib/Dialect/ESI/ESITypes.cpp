@@ -64,6 +64,10 @@ WindowType::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
         if (numItems > arrField.getSize())
           return emitError() << "num items is larger than array size in field "
                              << field.name;
+        if (frame.getMembers().size() != 1)
+          return emitError()
+                 << "array with size specified must be in their own frame (in "
+                 << field.name << ")";
       }
       frameFields.erase(f);
     }
@@ -78,9 +82,77 @@ WindowType::verify(llvm::function_ref<InFlightDiagnostic()> emitError,
   return success();
 }
 
+hw::UnionType WindowType::getLoweredType() const {
+  // Assemble a fast lookup of struct fields to types.
+  auto into = hw::type_cast<hw::StructType>(getInto());
+  SmallDenseMap<StringAttr, Type> intoFields;
+  for (hw::StructType::FieldInfo field : into.getElements())
+    intoFields[field.name] = field.type;
+
+  // Build the union, frame by frame
+  SmallVector<hw::UnionType::FieldInfo, 4> unionFields;
+  for (WindowFrameType frame : getFrames()) {
+
+    // ... field by field.
+    SmallVector<hw::StructType::FieldInfo, 4> fields;
+    for (WindowFieldType field : frame.getMembers()) {
+      auto fieldTypeIter = intoFields.find(field.getFieldName());
+      assert(fieldTypeIter != intoFields.end());
+
+      // If the number of items isn't specified, just use the type.
+      if (field.getNumItems() == 0) {
+        fields.push_back({field.getFieldName(), fieldTypeIter->getSecond()});
+      } else {
+        // If the number of items is specified, we can assume that it's an array
+        // type.
+        auto array = hw::type_cast<hw::ArrayType>(fieldTypeIter->getSecond());
+        assert(fields.empty()); // Checked by the validator.
+
+        // The first union entry should be an array of length numItems.
+        fields.push_back(
+            {field.getFieldName(),
+             hw::ArrayType::get(array.getElementType(), field.getNumItems())});
+        unionFields.push_back(
+            {frame.getName(), hw::StructType::get(getContext(), fields), 0});
+        fields.clear();
+
+        // If the array size is not a multiple of numItems, we need another
+        // frame for the left overs.
+        size_t leftOver = array.getSize() % field.getNumItems();
+        if (leftOver) {
+          fields.push_back(
+              {field.getFieldName(),
+               hw::ArrayType::get(array.getElementType(), leftOver)});
+
+          unionFields.push_back(
+              {StringAttr::get(getContext(),
+                               Twine(frame.getName().getValue(), "_leftOver")),
+               hw::StructType::get(getContext(), fields), 0});
+          fields.clear();
+        }
+      }
+    }
+
+    if (!fields.empty())
+      unionFields.push_back(
+          {frame.getName(), hw::StructType::get(getContext(), fields), 0});
+  }
+
+  return hw::UnionType::get(getContext(), unionFields);
+}
+
 void ESIDialect::registerTypes() {
   addTypes<
 #define GET_TYPEDEF_LIST
 #include "circt/Dialect/ESI/ESITypes.cpp.inc"
       >();
+}
+
+mlir::Type circt::esi::innerType(mlir::Type type) {
+  circt::esi::ChannelType chan =
+      type.dyn_cast_or_null<circt::esi::ChannelType>();
+  if (chan) // Unwrap the channel if it's a channel.
+    type = chan.getInner();
+
+  return type;
 }

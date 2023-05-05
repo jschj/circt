@@ -33,6 +33,7 @@ using namespace seq;
 namespace {
 struct SeqToSVPass : public impl::LowerSeqToSVBase<SeqToSVPass> {
   void runOnOperation() override;
+  using LowerSeqToSVBase::lowerToAlwaysFF;
 };
 struct SeqFIRRTLToSVPass
     : public impl::LowerSeqFIRRTLToSVBase<SeqFIRRTLToSVPass> {
@@ -63,8 +64,11 @@ namespace {
 /// Lower CompRegOp to `sv.reg` and `sv.alwaysff`. Use a posedge clock and
 /// synchronous reset.
 template <typename OpTy>
-struct CompRegLower : public OpConversionPattern<OpTy> {
+class CompRegLower : public OpConversionPattern<OpTy> {
 public:
+  CompRegLower(MLIRContext *context, bool lowerToAlwaysFF)
+      : OpConversionPattern<OpTy>(context), lowerToAlwaysFF(lowerToAlwaysFF) {}
+
   using OpConversionPattern<OpTy>::OpConversionPattern;
   using OpAdaptor = typename OpConversionPattern<OpTy>::OpAdaptor;
 
@@ -85,23 +89,41 @@ public:
     circt::sv::setSVAttributes(svReg, circt::sv::getSVAttributes(reg));
 
     auto regVal = rewriter.create<sv::ReadInOutOp>(loc, svReg);
-    if (reg.getReset() && reg.getResetValue()) {
-      rewriter.create<sv::AlwaysFFOp>(
-          loc, sv::EventControl::AtPosEdge, reg.getClk(), ResetType::SyncReset,
-          sv::EventControl::AtPosEdge, reg.getReset(),
-          [&]() { createAssign(rewriter, svReg, reg); },
-          [&]() {
-            rewriter.create<sv::PAssignOp>(loc, svReg, reg.getResetValue());
-          });
+
+    auto assignValue = [&] { createAssign(rewriter, svReg, reg); };
+    auto assignReset = [&] {
+      rewriter.create<sv::PAssignOp>(loc, svReg, adaptor.getResetValue());
+    };
+
+    if (adaptor.getReset() && adaptor.getResetValue()) {
+      if (lowerToAlwaysFF) {
+        rewriter.create<sv::AlwaysFFOp>(
+            loc, sv::EventControl::AtPosEdge, adaptor.getClk(),
+            ResetType::SyncReset, sv::EventControl::AtPosEdge,
+            adaptor.getReset(), assignValue, assignReset);
+      } else {
+        rewriter.create<sv::AlwaysOp>(
+            loc, sv::EventControl::AtPosEdge, adaptor.getClk(), [&] {
+              rewriter.create<sv::IfOp>(loc, adaptor.getReset(), assignReset,
+                                        assignValue);
+            });
+      }
     } else {
-      rewriter.create<sv::AlwaysFFOp>(
-          loc, sv::EventControl::AtPosEdge, reg.getClk(),
-          [&]() { createAssign(rewriter, svReg, reg); });
+      if (lowerToAlwaysFF) {
+        rewriter.create<sv::AlwaysFFOp>(loc, sv::EventControl::AtPosEdge,
+                                        adaptor.getClk(), assignValue);
+      } else {
+        rewriter.create<sv::AlwaysOp>(loc, sv::EventControl::AtPosEdge,
+                                      adaptor.getClk(), assignValue);
+      }
     }
 
     rewriter.replaceOp(reg, {regVal});
     return success();
   }
+
+private:
+  bool lowerToAlwaysFF;
 };
 } // namespace
 
@@ -267,13 +289,40 @@ void FirRegLower::lower() {
               builder.create<sv::IfDefProceduralOp>(randInitRef, [&] {
                 // Create randomization vector
                 SmallVector<Value> randValues;
-                for (uint64_t x = 0; x < (maxBit + 31) / 32; ++x) {
-                  auto lhs = builder.create<sv::LogicOp>(
-                      loc, builder.getIntegerType(32),
-                      "_RANDOM_" + llvm::utostr(x));
-                  auto rhs = builder.create<sv::MacroRefExprSEOp>(
-                      loc, builder.getIntegerType(32), "RANDOM");
-                  builder.create<sv::BPAssignOp>(loc, lhs, rhs);
+                auto numRandomCalls = (maxBit + 31) / 32;
+                auto logic = builder.create<sv::LogicOp>(
+                    loc,
+                    hw::UnpackedArrayType::get(builder.getIntegerType(32),
+                                               numRandomCalls),
+                    "_RANDOM");
+                // Indvar's width must be equal to `ceil(log2(numRandomCalls +
+                // 1))` to avoid overflow.
+                auto inducionVariableWidth =
+                    llvm::Log2_64_Ceil(numRandomCalls + 1);
+                auto arrayIndexWith = llvm::Log2_64_Ceil(numRandomCalls);
+                auto lb = getOrCreateConstant(
+                    loc, APInt::getZero(inducionVariableWidth));
+                auto ub = getOrCreateConstant(
+                    loc, APInt(inducionVariableWidth, numRandomCalls));
+                auto step =
+                    getOrCreateConstant(loc, APInt(inducionVariableWidth, 1));
+                auto forLoop = builder.create<sv::ForOp>(
+                    loc, lb, ub, step, "i", [&](BlockArgument iter) {
+                      auto rhs = builder.create<sv::MacroRefExprSEOp>(
+                          loc, builder.getIntegerType(32), "RANDOM");
+                      Value iterValue = iter;
+                      if (!iter.getType().isInteger(arrayIndexWith))
+                        iterValue = builder.create<comb::ExtractOp>(
+                            loc, iterValue, 0, arrayIndexWith);
+                      auto lhs = builder.create<sv::ArrayIndexInOutOp>(
+                          loc, logic, iterValue);
+                      builder.create<sv::BPAssignOp>(loc, lhs, rhs);
+                    });
+                builder.setInsertionPointAfter(forLoop);
+                for (uint64_t x = 0; x < numRandomCalls; ++x) {
+                  auto lhs = builder.create<sv::ArrayIndexInOutOp>(
+                      loc, logic,
+                      getOrCreateConstant(loc, APInt(arrayIndexWith, x)));
                   randValues.push_back(lhs.getResult());
                 }
 
@@ -282,6 +331,7 @@ void FirRegLower::lower() {
                   initialize(builder, svReg, randValues);
               });
             }
+
             if (!asyncResets.empty()) {
               // If the register is async reset, we need to insert extra
               // initialization in post-randomization so that we can set the
@@ -696,8 +746,8 @@ void SeqToSVPass::runOnOperation() {
   target.addIllegalDialect<SeqDialect>();
   target.addLegalDialect<sv::SVDialect>();
   RewritePatternSet patterns(&ctxt);
-  patterns.add<CompRegLower<CompRegOp>>(&ctxt);
-  patterns.add<CompRegLower<CompRegClockEnabledOp>>(&ctxt);
+  patterns.add<CompRegLower<CompRegOp>>(&ctxt, lowerToAlwaysFF);
+  patterns.add<CompRegLower<CompRegClockEnabledOp>>(&ctxt, lowerToAlwaysFF);
 
   if (failed(applyPartialConversion(top, target, std::move(patterns))))
     signalPassFailure();
@@ -711,8 +761,12 @@ void SeqFIRRTLToSVPass::runOnOperation() {
   numSubaccessRestored += firRegLower.numSubaccessRestored;
 }
 
-std::unique_ptr<Pass> circt::seq::createSeqLowerToSVPass() {
-  return std::make_unique<SeqToSVPass>();
+std::unique_ptr<Pass>
+circt::seq::createSeqLowerToSVPass(std::optional<bool> lowerToAlwaysFF) {
+  auto pass = std::make_unique<SeqToSVPass>();
+  if (lowerToAlwaysFF)
+    pass->lowerToAlwaysFF = *lowerToAlwaysFF;
+  return pass;
 }
 
 std::unique_ptr<Pass> circt::seq::createSeqFIRRTLLowerToSVPass(

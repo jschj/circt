@@ -26,6 +26,21 @@ def OMDialect : Dialect {
     For more information about the Object Model dialect, see the
     [Object Model Dialect Rationale](./RationaleOM.md).
   }];
+
+  let useDefaultAttributePrinterParser = 1;
+  let useDefaultTypePrinterParser = 1;
+
+  let dependentDialects = [
+    "circt::hw::HWDialect"
+  ];
+
+  let extraClassDeclaration = [{
+    /// Register all OM types.
+    void registerTypes();
+
+    /// Register all OM types.
+    void registerAttributes();
+  }];
 }
 
 #endif // CIRCT_DIALECT_OM_OMDIALECT

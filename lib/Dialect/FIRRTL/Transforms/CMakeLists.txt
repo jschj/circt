@@ -22,6 +22,7 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
   LowerAnnotations.cpp
   LowerCHIRRTL.cpp
   LowerIntrinsics.cpp
+  LowerMatches.cpp
   LowerMemory.cpp
   LowerTypes.cpp
   LowerXMR.cpp
@@ -38,6 +39,7 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
   RemoveUnusedPorts.cpp
   SFCCompat.cpp
   VBToBV.cpp
+  Vectorization.cpp
   WireDFT.cpp
 
   DEPENDS

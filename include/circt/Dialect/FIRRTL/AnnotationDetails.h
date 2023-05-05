@@ -28,6 +28,7 @@ constexpr const char *rawAnnotations = "rawAnnotations";
 // Annotation Class Names
 //===----------------------------------------------------------------------===//
 
+constexpr const char *conventionAnnoClass = "circt.ConventionAnnotation";
 constexpr const char *dontTouchAnnoClass =
     "firrtl.transforms.DontTouchAnnotation";
 constexpr const char *enumComponentAnnoClass =
@@ -208,6 +209,9 @@ constexpr const char *wiringSinkAnnoClass =
     "firrtl.passes.wiring.SinkAnnotation";
 constexpr const char *wiringSourceAnnoClass =
     "firrtl.passes.wiring.SourceAnnotation";
+
+// Attribute annotations.
+constexpr const char *attributeAnnoClass = "firrtl.AttributeAnnotation";
 
 } // namespace firrtl
 } // namespace circt

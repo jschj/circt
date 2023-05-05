@@ -704,7 +704,7 @@ void EmitOMIRPass::makeTrackerAbsolute(Tracker &tracker) {
   // Pick a name for the NLA that doesn't collide with anything.
   StringAttr opName;
   if (auto module = dyn_cast<FModuleLike>(tracker.op))
-    opName = module.moduleNameAttr();
+    opName = module.getModuleNameAttr();
   else
     opName = tracker.op->getAttrOfType<StringAttr>("name");
   auto nlaName = circuitNamespace->newName("omir_nla_" + opName.getValue());
@@ -712,7 +712,7 @@ void EmitOMIRPass::makeTrackerAbsolute(Tracker &tracker) {
   // Get all the paths instantiating this module. If there is an NLA already
   // attached to this tracker, we use it as a base to disambiguate the path to
   // the memory.
-  Operation *mod;
+  hw::HWModuleLike mod;
   if (tracker.nla)
     mod = instanceGraph->lookup(tracker.nla.root())->getModule();
   else
@@ -745,7 +745,7 @@ void EmitOMIRPass::makeTrackerAbsolute(Tracker &tracker) {
   };
   // Add the path up to where the NLA starts.
   for (auto inst : paths[0])
-    addToPath(inst, inst.instanceNameAttr());
+    addToPath(inst, inst.getInstanceNameAttr());
   // Add the path from the NLA to the op.
   if (tracker.nla) {
     auto path = tracker.nla.getNamepath().getValue();
@@ -768,7 +768,7 @@ void EmitOMIRPass::makeTrackerAbsolute(Tracker &tracker) {
 
   // Add the op itself.
   if (auto module = dyn_cast<FModuleLike>(tracker.op))
-    namepath.push_back(FlatSymbolRefAttr::get(module.moduleNameAttr()));
+    namepath.push_back(FlatSymbolRefAttr::get(module.getModuleNameAttr()));
   else
     namepath.push_back(getInnerRefTo(tracker.op));
 
@@ -922,7 +922,7 @@ void EmitOMIRPass::emitOptionalRTLPorts(DictionaryAttr node,
     return;
   }
   LLVM_DEBUG(llvm::dbgs() << "Emitting RTL ports for module `"
-                          << module.moduleName() << "`\n");
+                          << module.getModuleName() << "`\n");
 
   // Emit the JSON.
   SmallString<64> buf;
@@ -939,9 +939,9 @@ void EmitOMIRPass::emitOptionalRTLPorts(DictionaryAttr node,
         jsonStream.object([&] {
           // Emit the `ref` field.
           buf.assign("OMDontTouchedReferenceTarget:~");
-          if (module.moduleNameAttr() == dutModuleName) {
+          if (module.getModuleNameAttr() == dutModuleName) {
             // If module is DUT, then root the target relative to the DUT.
-            buf.append(module.moduleName());
+            buf.append(module.getModuleName());
           } else {
             buf.append(getOperation().getName());
           }
@@ -1245,6 +1245,8 @@ hw::InnerRefAttr EmitOMIRPass::getInnerRefTo(FModuleLike module,
 }
 
 FIRRTLType EmitOMIRPass::getTypeOf(Operation *op) {
+  if (auto fop = dyn_cast<Forceable>(op))
+    return fop.getDataType();
   assert(op->getNumResults() == 1 &&
          op->getResult(0).getType().isa<FIRRTLType>() &&
          "op must have a single FIRRTLType result");

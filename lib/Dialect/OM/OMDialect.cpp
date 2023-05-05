@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/OM/OMDialect.h"
+#include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/OM/OMOps.h"
 
 #include "circt/Dialect/OM/OMDialect.cpp.inc"
@@ -20,4 +21,7 @@ void circt::om::OMDialect::initialize() {
 #define GET_OP_LIST
 #include "circt/Dialect/OM/OM.cpp.inc"
       >();
+
+  registerTypes();
+  registerAttributes();
 }

@@ -216,6 +216,21 @@ struct Equivalence {
     nonessentialAttributes.insert(StringAttr::get(context, "inner_sym"));
   }
 
+  std::string prettyPrint(Attribute attr) {
+    SmallString<64> buffer;
+    llvm::raw_svector_ostream os(buffer);
+    if (auto integerAttr = dyn_cast<IntegerAttr>(attr)) {
+      os << "0x";
+      if (integerAttr.getType().isSignlessInteger())
+        integerAttr.getValue().toStringUnsigned(buffer, /*radix=*/16);
+      else
+        integerAttr.getAPSInt().toString(buffer, /*radix=*/16);
+
+    } else
+      os << attr;
+    return std::string(buffer);
+  }
+
   // NOLINTNEXTLINE(misc-no-recursion)
   LogicalResult check(InFlightDiagnostic &diag, const Twine &message,
                       Operation *a, BundleType aType, Operation *b,
@@ -426,8 +441,9 @@ struct Equivalence {
       } else if (aAttr != bAttr) {
         diag.attachNote(a->getLoc())
             << "first operation has attribute '" << attrName.getValue()
-            << "' with value " << aAttr;
-        diag.attachNote(b->getLoc()) << "second operation has value " << bAttr;
+            << "' with value " << prettyPrint(aAttr);
+        diag.attachNote(b->getLoc())
+            << "second operation has value " << prettyPrint(bAttr);
         return failure();
       }
       seenAttrs.insert(attrName);
@@ -680,8 +696,8 @@ struct Deduper {
     if (auto to = dyn_cast<FModuleOp>(*toModule))
       rewriteModuleNLAs(renameMap, to, cast<FModuleOp>(*fromModule));
     else
-      rewriteExtModuleNLAs(renameMap, toModule.moduleNameAttr(),
-                           fromModule.moduleNameAttr());
+      rewriteExtModuleNLAs(renameMap, toModule.getModuleNameAttr(),
+                           fromModule.getModuleNameAttr());
 
     replaceInstances(toModule, fromModule);
   }
@@ -701,7 +717,8 @@ struct Deduper {
 private:
   /// Get a cached namespace for a module.
   ModuleNamespace &getNamespace(Operation *module) {
-    auto [it, inserted] = moduleNamespaces.try_emplace(module, module);
+    auto [it, inserted] =
+        moduleNamespaces.try_emplace(module, cast<FModuleLike>(module));
     return it->second;
   }
 
@@ -732,9 +749,9 @@ private:
   /// of the "toModule".
   void replaceInstances(FModuleLike toModule, Operation *fromModule) {
     // Replace all instances of the other module.
-    auto *fromNode = instanceGraph[fromModule];
-    auto *toNode = instanceGraph[::cast<hw::HWModuleLike>(*toModule)];
-    auto toModuleRef = FlatSymbolRefAttr::get(toModule.moduleNameAttr());
+    auto *fromNode = instanceGraph[::cast<hw::HWModuleLike>(fromModule)];
+    auto *toNode = instanceGraph[toModule];
+    auto toModuleRef = FlatSymbolRefAttr::get(toModule.getModuleNameAttr());
     for (auto *oldInstRec : llvm::make_early_inc_range(fromNode->uses())) {
       auto inst = ::cast<InstanceOp>(*oldInstRec->getInstance());
       inst.setModuleNameAttr(toModuleRef);
@@ -760,8 +777,9 @@ private:
     namepath.append(baseNamepath.begin(), baseNamepath.end());
 
     auto loc = fromModule->getLoc();
+    auto *fromNode = instanceGraph[cast<hw::HWModuleLike>(fromModule)];
     SmallVector<FlatSymbolRefAttr> nlas;
-    for (auto *instanceRecord : instanceGraph[fromModule]->uses()) {
+    for (auto *instanceRecord : fromNode->uses()) {
       auto parent = cast<FModuleOp>(*instanceRecord->getParent()->getModule());
       auto inst = instanceRecord->getInstance();
       namepath[0] = OpAnnoTarget(inst).getNLAReference(getNamespace(parent));
@@ -966,7 +984,7 @@ private:
         continue;
       }
       // Otherwise make the annotation non-local and add it to the set.
-      makeAnnotationNonLocal(toModule.moduleNameAttr(), to, fromModule, anno,
+      makeAnnotationNonLocal(toModule.getModuleNameAttr(), to, fromModule, anno,
                              newAnnotations);
     }
   }
@@ -1155,13 +1173,12 @@ private:
 /// This fixes up connects when the field names of a bundle type changes.  It
 /// finds all fields which were previously bulk connected and legalizes it
 /// into a connect for each field.
-template <typename T>
 void fixupConnect(ImplicitLocOpBuilder &builder, Value dst, Value src) {
   // If the types already match we can emit a connect.
   auto dstType = dst.getType();
   auto srcType = src.getType();
   if (dstType == srcType) {
-    builder.create<T>(dst, src);
+    emitConnect(builder, dst, src);
     return;
   }
   // It must be a bundle type and the field name has changed. We have to
@@ -1175,50 +1192,7 @@ void fixupConnect(ImplicitLocOpBuilder &builder, Value dst, Value src) {
       std::swap(srcBundle, dstBundle);
       std::swap(srcField, dstField);
     }
-    fixupConnect<T>(builder, dstField, srcField);
-  }
-}
-
-/// Replaces a ConnectOp or StrictConnectOp with new bundle types.
-template <typename T>
-void fixupConnect(T connect) {
-  ImplicitLocOpBuilder builder(connect.getLoc(), connect);
-  fixupConnect<T>(builder, connect.getDest(), connect.getSrc());
-  connect->erase();
-}
-
-/// When we replace a bundle type with a similar bundle with different field
-/// names, we have to rewrite all the code to use the new field names. This
-/// mostly affects subfield result types and any bulk connects.
-void fixupReferences(Value oldValue, Type newType) {
-  SmallVector<std::pair<Value, Type>> workList;
-  workList.emplace_back(oldValue, newType);
-  while (!workList.empty()) {
-    auto [oldValue, newType] = workList.pop_back_val();
-    auto oldType = oldValue.getType();
-    // If the two types are identical, we don't need to do anything, otherwise
-    // update the type in place.
-    if (oldType == newType)
-      continue;
-    oldValue.setType(newType);
-    for (auto *op : llvm::make_early_inc_range(oldValue.getUsers())) {
-      if (auto subfield = dyn_cast<SubfieldOp>(op)) {
-        // Rewrite a subfield op to return the correct type.
-        auto index = subfield.getFieldIndex();
-        auto result = subfield.getResult();
-        auto newResultType = newType.cast<BundleType>().getElementType(index);
-        workList.emplace_back(result, newResultType);
-        continue;
-      }
-      if (auto connect = dyn_cast<ConnectOp>(op)) {
-        fixupConnect<ConnectOp>(connect);
-        continue;
-      }
-      if (auto strict = dyn_cast<StrictConnectOp>(op)) {
-        fixupConnect<StrictConnectOp>(strict);
-        continue;
-      }
-    }
+    fixupConnect(builder, dstField, srcField);
   }
 }
 
@@ -1229,9 +1203,27 @@ void fixupAllModules(InstanceGraph &instanceGraph) {
   for (auto *node : instanceGraph) {
     auto module = cast<FModuleLike>(*node->getModule());
     for (auto *instRec : node->uses()) {
-      auto inst = instRec->getInstance();
-      for (unsigned i = 0, e = getNumPorts(module); i < e; ++i)
-        fixupReferences(inst->getResult(i), module.getPortType(i));
+      auto inst = cast<InstanceOp>(instRec->getInstance());
+      ImplicitLocOpBuilder builder(inst.getLoc(), inst->getContext());
+      builder.setInsertionPointAfter(inst);
+      for (unsigned i = 0, e = getNumPorts(module); i < e; ++i) {
+        auto result = inst.getResult(i);
+        auto newType = module.getPortType(i);
+        auto oldType = result.getType();
+        // If the type has not changed, we don't have to fix up anything.
+        if (newType == oldType)
+          continue;
+        // If the type changed we transform it back to the old type with an
+        // intermediate wire.
+        auto wire =
+            builder.create<WireOp>(oldType, inst.getPortName(i)).getResult();
+        result.replaceAllUsesWith(wire);
+        result.setType(newType);
+        if (inst.getPortDirection(i) == Direction::Out)
+          fixupConnect(builder, wire, result);
+        else
+          fixupConnect(builder, result, wire);
+      }
     }
   }
 }
@@ -1303,7 +1295,7 @@ class DedupPass : public DedupBase<DedupPass> {
         }));
 
     for (auto module : modules) {
-      auto moduleName = module.moduleNameAttr();
+      auto moduleName = module.getModuleNameAttr();
       // If the module is marked with NoDedup, just skip it.
       if (AnnotationSet(module).hasAnnotation(noDedupClass)) {
         // We record it in the dedup map to help detect errors when the user
@@ -1327,7 +1319,7 @@ class DedupPass : public DedupBase<DedupPass> {
       if (it != moduleHashes.end()) {
         auto original = cast<FModuleLike>(it->second);
         // Record the group ID of the other module.
-        dedupMap[moduleName] = original.moduleNameAttr();
+        dedupMap[moduleName] = original.getModuleNameAttr();
         deduper.dedup(original, module);
         ++erasedModules;
         anythingChanged = true;

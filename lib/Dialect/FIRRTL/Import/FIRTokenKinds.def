@@ -45,7 +45,8 @@ TOK_MARKER(eof)
 TOK_MARKER(error)
 
 // Identifiers.
-TOK_IDENTIFIER(identifier) // foo
+TOK_IDENTIFIER(identifier)         // foo
+TOK_IDENTIFIER(literal_identifier) // `42`
 
 // Literals
 TOK_LITERAL(integer)        // 42
@@ -92,6 +93,7 @@ TOK_KEYWORD(UInt)
 TOK_KEYWORD(attach)
 TOK_KEYWORD(circuit)
 TOK_KEYWORD(cmem)
+TOK_KEYWORD(connect)
 TOK_KEYWORD(define)
 TOK_KEYWORD(defname)
 TOK_KEYWORD(intrinsic)
@@ -103,6 +105,7 @@ TOK_KEYWORD(infer)
 TOK_KEYWORD(input)
 TOK_KEYWORD(inst)
 TOK_KEYWORD(invalid)
+TOK_KEYWORD(invalidate)
 TOK_KEYWORD(is)
 TOK_KEYWORD(mem)
 TOK_KEYWORD(module)
@@ -117,6 +120,7 @@ TOK_KEYWORD(rdwr)
 TOK_KEYWORD(read)
 TOK_KEYWORD(ref)
 TOK_KEYWORD(reg)
+TOK_KEYWORD(regreset)
 TOK_KEYWORD(reset)
 TOK_KEYWORD(skip)
 TOK_KEYWORD(smem)
@@ -134,6 +138,12 @@ TOK_LPKEYWORD(stop)
 TOK_LPKEYWORD(assert)
 TOK_LPKEYWORD(assume)
 TOK_LPKEYWORD(cover)
+
+TOK_LPKEYWORD(force)
+TOK_LPKEYWORD(force_initial)
+TOK_LPKEYWORD(release)
+TOK_LPKEYWORD(release_initial)
+
 TOK_LPKEYWORD(read)
 TOK_LPKEYWORD(probe)
 TOK_LPKEYWORD(rwprobe)

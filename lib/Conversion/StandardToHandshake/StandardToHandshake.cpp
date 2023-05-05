@@ -11,11 +11,11 @@
 
 #include "circt/Conversion/StandardToHandshake.h"
 #include "../PassDetail.h"
-#include "circt/Analysis/ControlFlowLoopAnalysis.h"
 #include "circt/Dialect/Handshake/HandshakeOps.h"
 #include "circt/Dialect/Handshake/HandshakePasses.h"
 #include "circt/Dialect/Pipeline/Pipeline.h"
 #include "circt/Support/BackedgeBuilder.h"
+#include "mlir/Analysis/CFGLoopInfo.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
@@ -48,9 +48,9 @@
 
 using namespace mlir;
 using namespace mlir::func;
+using namespace mlir::affine;
 using namespace circt;
 using namespace circt::handshake;
-using namespace circt::analysis;
 using namespace std;
 
 // ============================================================================
@@ -67,7 +67,7 @@ public:
     addLegalDialect<mlir::func::FuncDialect>();
     addLegalDialect<mlir::arith::ArithDialect>();
     addIllegalDialect<mlir::scf::SCFDialect>();
-    addIllegalDialect<mlir::AffineDialect>();
+    addIllegalDialect<AffineDialect>();
 
     /// The root operation to be replaced is marked dynamically legal
     /// based on the lowering status of the given operation, see
@@ -541,7 +541,8 @@ public:
   FeedForwardNetworkRewriter(HandshakeLowering &hl,
                              ConversionPatternRewriter &rewriter)
       : hl(hl), rewriter(rewriter), postDomInfo(hl.getRegion().getParentOp()),
-        domInfo(hl.getRegion().getParentOp()), loopAnalysis(hl.getRegion()) {}
+        domInfo(hl.getRegion().getParentOp()),
+        loopInfo(domInfo.getDomTree(&hl.getRegion())) {}
   LogicalResult apply();
 
 private:
@@ -549,7 +550,7 @@ private:
   ConversionPatternRewriter &rewriter;
   PostDominanceInfo postDomInfo;
   DominanceInfo domInfo;
-  ControlFlowLoopAnalysis loopAnalysis;
+  CFGLoopInfo loopInfo;
 
   using BlockPair = std::pair<Block *, Block *>;
   using BlockPairs = SmallVector<BlockPair>;
@@ -557,8 +558,8 @@ private:
 
   BufferOp buildSplitNetwork(Block *splitBlock,
                              handshake::ConditionalBranchOp &ctrlBr);
-  void buildMergeNetwork(Block *mergeBlock, BufferOp buf,
-                         handshake::ConditionalBranchOp &ctrlBr);
+  LogicalResult buildMergeNetwork(Block *mergeBlock, BufferOp buf,
+                                  handshake::ConditionalBranchOp &ctrlBr);
 
   // Determines if the cmerge inpus match the cond_br output order.
   bool requiresOperandFlip(ControlMergeOp &ctrlMerge,
@@ -569,22 +570,25 @@ private:
 
 LogicalResult
 HandshakeLowering::feedForwardRewriting(ConversionPatternRewriter &rewriter) {
+  // Nothing to do on a single block region.
+  if (this->getRegion().hasOneBlock())
+    return success();
   return FeedForwardNetworkRewriter(*this, rewriter).apply();
 }
 
-static bool loopsHaveSingleExit(ControlFlowLoopAnalysis &loopAnalysis) {
-  for (LoopInfo &info : loopAnalysis.topLevelLoops)
-    if (info.exitBlocks.size() > 1)
+static bool loopsHaveSingleExit(CFGLoopInfo &loopInfo) {
+  for (CFGLoop *loop : loopInfo.getTopLevelLoops())
+    if (!loop->getExitBlock())
       return false;
   return true;
 }
 
 bool FeedForwardNetworkRewriter::formsIrreducibleCF(Block *splitBlock,
                                                     Block *mergeBlock) {
-  LoopInfo *info = loopAnalysis.getLoopInfoForHeader(mergeBlock);
-  for (auto mergePred : mergeBlock->getPredecessors()) {
+  CFGLoop *loop = loopInfo.getLoopFor(mergeBlock);
+  for (auto *mergePred : mergeBlock->getPredecessors()) {
     // Skip loop predecessors
-    if (info && info->inLoop.contains(mergePred))
+    if (loop && loop->contains(mergePred))
       continue;
 
     // A DAG-CFG is irreducible, iff a merge block has a predecessor that can be
@@ -617,7 +621,7 @@ FeedForwardNetworkRewriter::findBlockPairs(BlockPairs &blockPairs) {
 
   // Assumes that each loop has only one exit block. Such an error should
   // already be reported by the loop rewriting.
-  assert(loopsHaveSingleExit(loopAnalysis) &&
+  assert(loopsHaveSingleExit(loopInfo) &&
          "expected loop to only have one exit block.");
 
   for (Block &b : r) {
@@ -625,7 +629,7 @@ FeedForwardNetworkRewriter::findBlockPairs(BlockPairs &blockPairs) {
       continue;
 
     // Loop headers cannot be merge blocks.
-    if (loopAnalysis.isLoopElement(&b))
+    if (loopInfo.getLoopFor(&b))
       continue;
 
     assert(b.getNumSuccessors() == 2);
@@ -645,9 +649,9 @@ FeedForwardNetworkRewriter::findBlockPairs(BlockPairs &blockPairs) {
     }
 
     unsigned nonLoopPreds = 0;
-    LoopInfo *info = loopAnalysis.getLoopInfoForHeader(mergeBlock);
-    for (auto pred : mergeBlock->getPredecessors()) {
-      if (info && info->inLoop.contains(pred))
+    CFGLoop *loop = loopInfo.getLoopFor(mergeBlock);
+    for (auto *pred : mergeBlock->getPredecessors()) {
+      if (loop && loop->contains(pred))
         continue;
       nonLoopPreds++;
     }
@@ -665,17 +669,16 @@ FeedForwardNetworkRewriter::findBlockPairs(BlockPairs &blockPairs) {
 }
 
 LogicalResult FeedForwardNetworkRewriter::apply() {
-  if (failed(loopAnalysis.analyzeRegion()))
-    return failure();
-
   BlockPairs pairs;
+
   if (failed(findBlockPairs(pairs)))
     return failure();
 
   for (auto [splitBlock, mergeBlock] : pairs) {
     handshake::ConditionalBranchOp ctrlBr;
     BufferOp buffer = buildSplitNetwork(splitBlock, ctrlBr);
-    buildMergeNetwork(mergeBlock, buffer, ctrlBr);
+    if (failed(buildMergeNetwork(mergeBlock, buffer, ctrlBr)))
+      return failure();
   }
 
   return success();
@@ -712,13 +715,16 @@ BufferOp FeedForwardNetworkRewriter::buildSplitNetwork(
                                               BufferTypeEnum::fifo);
 }
 
-void FeedForwardNetworkRewriter::buildMergeNetwork(
+LogicalResult FeedForwardNetworkRewriter::buildMergeNetwork(
     Block *mergeBlock, BufferOp buf, handshake::ConditionalBranchOp &ctrlBr) {
   // Replace control merge with mux
   auto ctrlMerges = mergeBlock->getOps<handshake::ControlMergeOp>();
   assert(std::distance(ctrlMerges.begin(), ctrlMerges.end()) == 1);
 
   handshake::ControlMergeOp ctrlMerge = *ctrlMerges.begin();
+  // This input might contain irreducible loops that we cannot handle.
+  if (ctrlMerge.getNumOperands() != 2)
+    return ctrlMerge.emitError("expected cmerges to have two operands");
   rewriter.setInsertionPointAfter(ctrlMerge);
   Location loc = ctrlMerge->getLoc();
 
@@ -753,6 +759,7 @@ void FeedForwardNetworkRewriter::buildMergeNetwork(
 
   // Replace with new ctrl value from mux and the index
   rewriter.replaceOp(ctrlMerge, {newCtrl, condAsIndex});
+  return success();
 }
 
 bool FeedForwardNetworkRewriter::requiresOperandFlip(
@@ -795,7 +802,7 @@ private:
   // An exit pair is a pair of <in loop block, outside loop block> that
   // indicates where control leaves a loop.
   using ExitPair = std::pair<Block *, Block *>;
-  LogicalResult processOuterLoop(Location loc, LoopInfo &loopInfo);
+  LogicalResult processOuterLoop(Location loc, CFGLoop *loop);
 
   // Builds the loop continue network in between the loop header and its loop
   // latch. The loop continuation network will replace the existing control
@@ -829,17 +836,18 @@ HandshakeLowering::loopNetworkRewriting(ConversionPatternRewriter &rewriter) {
 LogicalResult
 LoopNetworkRewriter::processRegion(Region &r,
                                    ConversionPatternRewriter &rewriter) {
+  // Nothing to do on a single block region.
+  if (r.hasOneBlock())
+    return success();
   this->rewriter = &rewriter;
 
   Operation *op = r.getParentOp();
 
-  ControlFlowLoopAnalysis loopAnalysis(r);
-  if (failed(loopAnalysis.analyzeRegion())) {
-    return failure();
-  }
+  DominanceInfo domInfo(op);
+  CFGLoopInfo loopInfo(domInfo.getDomTree(&r));
 
-  for (LoopInfo &loopInfo : loopAnalysis.topLevelLoops) {
-    if (loopInfo.loopLatches.size() > 1)
+  for (CFGLoop *loop : loopInfo.getTopLevelLoops()) {
+    if (!loop->getLoopLatch())
       return emitError(op->getLoc()) << "Multiple loop latches detected "
                                         "(backedges from within the loop "
                                         "to the loop header). Loop task "
@@ -847,7 +855,7 @@ LoopNetworkRewriter::processRegion(Region &r,
                                         "loops with unified loop latches.";
 
     // This is the start of an outer loop - go process!
-    if (failed(processOuterLoop(op->getLoc(), loopInfo)))
+    if (failed(processOuterLoop(op->getLoc(), loop)))
       return failure();
   }
 
@@ -1041,14 +1049,16 @@ void LoopNetworkRewriter::buildExitNetwork(
 }
 
 LogicalResult LoopNetworkRewriter::processOuterLoop(Location loc,
-                                                    LoopInfo &loopInfo) {
+                                                    CFGLoop *loop) {
   // We determine the exit pairs of the loop; this is the in-loop nodes
   // which branch off to the exit nodes.
   llvm::SmallSet<ExitPair, 2> exitPairs;
-  for (auto *exitNode : loopInfo.exitBlocks) {
+  SmallVector<Block *> exitBlocks;
+  loop->getExitBlocks(exitBlocks);
+  for (auto *exitNode : exitBlocks) {
     for (auto *pred : exitNode->getPredecessors()) {
       // is the predecessor inside the loop?
-      if (!loopInfo.inLoop.contains(pred))
+      if (!loop->contains(pred))
         continue;
 
       ExitPair condPair = {pred, exitNode};
@@ -1057,7 +1067,7 @@ LogicalResult LoopNetworkRewriter::processOuterLoop(Location loc,
       exitPairs.insert(condPair);
     }
   }
-  assert(exitPairs.size() > 0 && "No exits from loop?");
+  assert(!exitPairs.empty() && "No exits from loop?");
 
   // The first precondition to our loop transformation is that only a single
   // exit pair exists in the loop.
@@ -1066,18 +1076,18 @@ LogicalResult LoopNetworkRewriter::processOuterLoop(Location loc,
            << "Multiple exits detected within a loop. Loop task pipelining is "
               "only supported for loops with unified loop exit blocks.";
 
-  BackedgeBuilder bebuilder(*rewriter, loopInfo.loopHeader->front().getLoc());
+  Block *header = loop->getHeader();
+  BackedgeBuilder bebuilder(*rewriter, header->front().getLoc());
 
   // Build the loop continue network. Loop continuation is triggered solely by
   // backedges to the header.
   auto loopPrimingRegisterInput = bebuilder.get(rewriter->getI1Type());
-  auto loopPrimingRegister =
-      buildContinueNetwork(loopInfo.loopHeader, *loopInfo.loopLatches.begin(),
-                           loopPrimingRegisterInput);
+  auto loopPrimingRegister = buildContinueNetwork(header, loop->getLoopLatch(),
+                                                  loopPrimingRegisterInput);
 
   // Build the loop exit network. Loop exiting is driven solely by exit pairs
   // from the loop.
-  buildExitNetwork(loopInfo.loopHeader, exitPairs, loopPrimingRegister,
+  buildExitNetwork(header, exitPairs, loopPrimingRegister,
                    loopPrimingRegisterInput);
 
   return success();
@@ -1227,7 +1237,7 @@ static LogicalResult getOpMemRef(Operation *op, Value &out) {
     out = memOp.getMemRef();
   else if (auto memOp = dyn_cast<memref::StoreOp>(op))
     out = memOp.getMemRef();
-  else if (isa<mlir::AffineReadOpInterface, mlir::AffineWriteOpInterface>(op)) {
+  else if (isa<AffineReadOpInterface, AffineWriteOpInterface>(op)) {
     MemRefAccess access(op);
     out = access.memref;
   }
@@ -1237,8 +1247,8 @@ static LogicalResult getOpMemRef(Operation *op, Value &out) {
 }
 
 static bool isMemoryOp(Operation *op) {
-  return isa<memref::LoadOp, memref::StoreOp, mlir::AffineReadOpInterface,
-             mlir::AffineWriteOpInterface>(op);
+  return isa<memref::LoadOp, memref::StoreOp, AffineReadOpInterface,
+             AffineWriteOpInterface>(op);
 }
 
 LogicalResult
@@ -1290,41 +1300,40 @@ HandshakeLowering::replaceMemoryOps(ConversionPatternRewriter &rewriter,
           newOp = rewriter.create<handshake::StoreOp>(
               op.getLoc(), storeOp.getValueToStore(), operands);
         })
-        .Case<mlir::AffineReadOpInterface, mlir::AffineWriteOpInterface>(
-            [&](auto) {
-              // Get essential memref access inforamtion.
-              MemRefAccess access(&op);
-              // The address of an affine load/store operation can be a result
-              // of an affine map, which is a linear combination of constants
-              // and parameters. Therefore, we should extract the affine map of
-              // each address and expand it into proper expressions that
-              // calculate the result.
-              mlir::AffineMap map;
-              if (auto loadOp = dyn_cast<mlir::AffineReadOpInterface>(op))
-                map = loadOp.getAffineMap();
-              else
-                map = dyn_cast<mlir::AffineWriteOpInterface>(op).getAffineMap();
+        .Case<AffineReadOpInterface, AffineWriteOpInterface>([&](auto) {
+          // Get essential memref access inforamtion.
+          MemRefAccess access(&op);
+          // The address of an affine load/store operation can be a result
+          // of an affine map, which is a linear combination of constants
+          // and parameters. Therefore, we should extract the affine map of
+          // each address and expand it into proper expressions that
+          // calculate the result.
+          AffineMap map;
+          if (auto loadOp = dyn_cast<AffineReadOpInterface>(op))
+            map = loadOp.getAffineMap();
+          else
+            map = dyn_cast<AffineWriteOpInterface>(op).getAffineMap();
 
-              // The returned object from expandAffineMap is an optional list of
-              // the expansion results from the given affine map, which are the
-              // actual address indices that can be used as operands for
-              // handshake LoadOp/StoreOp. The following processing requires it
-              // to be a valid result.
-              auto operands =
-                  expandAffineMap(rewriter, op.getLoc(), map, access.indices);
-              assert(operands && "Address operands of affine memref access "
-                                 "cannot be reduced.");
+          // The returned object from expandAffineMap is an optional list of
+          // the expansion results from the given affine map, which are the
+          // actual address indices that can be used as operands for
+          // handshake LoadOp/StoreOp. The following processing requires it
+          // to be a valid result.
+          auto operands =
+              expandAffineMap(rewriter, op.getLoc(), map, access.indices);
+          assert(operands && "Address operands of affine memref access "
+                             "cannot be reduced.");
 
-              if (isa<mlir::AffineReadOpInterface>(op)) {
-                auto loadOp = rewriter.create<handshake::LoadOp>(
-                    op.getLoc(), access.memref, *operands);
-                newOp = loadOp;
-                op.getResult(0).replaceAllUsesWith(loadOp.getDataResult());
-              } else {
-                newOp = rewriter.create<handshake::StoreOp>(
-                    op.getLoc(), op.getOperand(0), *operands);
-              }
-            })
+          if (isa<AffineReadOpInterface>(op)) {
+            auto loadOp = rewriter.create<handshake::LoadOp>(
+                op.getLoc(), access.memref, *operands);
+            newOp = loadOp;
+            op.getResult(0).replaceAllUsesWith(loadOp.getDataResult());
+          } else {
+            newOp = rewriter.create<handshake::StoreOp>(
+                op.getLoc(), op.getOperand(0), *operands);
+          }
+        })
         .Default([&](auto) {
           op.emitOpError("Load/store operation cannot be handled.");
         });
@@ -1707,30 +1716,6 @@ static LogicalResult lowerFuncOp(func::FuncOp funcOp, MLIRContext *ctx,
 }
 
 namespace {
-struct ConvertSelectOps : public OpConversionPattern<mlir::arith::SelectOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(mlir::arith::SelectOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<handshake::SelectOp>(op, adaptor.getCondition(),
-                                                     adaptor.getFalseValue(),
-                                                     adaptor.getTrueValue());
-    return success();
-  };
-};
-} // namespace
-
-LogicalResult handshake::postDataflowConvert(Operation *op) {
-  MLIRContext *context = op->getContext();
-  ConversionTarget target(*context);
-  target.addLegalDialect<handshake::HandshakeDialect>();
-  target.addIllegalOp<mlir::arith::SelectOp>();
-  RewritePatternSet patterns(context);
-  patterns.insert<ConvertSelectOps>(context);
-  return applyPartialConversion(op, target, std::move(patterns));
-}
-
-namespace {
 
 struct HandshakeRemoveBlockPass
     : HandshakeRemoveBlockBase<HandshakeRemoveBlockPass> {
@@ -1756,11 +1741,8 @@ struct StandardToHandshakePass
 
     // Legalize the resulting regions, removing basic blocks and performing
     // any simple conversions.
-    for (auto func : m.getOps<handshake::FuncOp>()) {
+    for (auto func : m.getOps<handshake::FuncOp>())
       removeBasicBlocks(func);
-      if (failed(postDataflowConvert(func)))
-        return signalPassFailure();
-    }
   }
 };
 

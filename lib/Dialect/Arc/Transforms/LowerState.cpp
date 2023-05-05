@@ -7,7 +7,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "PassDetails.h"
+#include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/HW/HWOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -99,7 +101,8 @@ struct ModuleLowering {
   LogicalResult lowerStates();
   LogicalResult lowerState(StateOp stateOp);
   LogicalResult lowerState(MemoryOp memOp);
-  LogicalResult lowerState(MemoryWriteOp memWriteOp);
+  LogicalResult lowerState(MemoryReadPortOp memReadOp);
+  LogicalResult lowerState(MemoryWritePortOp memWriteOp);
   LogicalResult lowerState(TapOp tapOp);
 
   LogicalResult cleanup();
@@ -123,7 +126,7 @@ static bool shouldMaterialize(Operation *op) {
 
   if (isa<MemoryOp, AllocStateOp, AllocMemoryOp, AllocStorageOp, ClockTreeOp,
           PassThroughOp, RootInputOp, RootOutputOp, StateWriteOp,
-          MemoryWriteOp>(op))
+          MemoryWritePortOp>(op))
     return false;
 
   return true;
@@ -150,54 +153,56 @@ Value ClockLowering::materializeValue(Value value) {
   if (auto mapped = materializedValues.lookupOrNull(value))
     return mapped;
 
+  struct WorkItem {
+    Operation *op;
+    SmallVector<Value, 2> operands;
+    WorkItem(Operation *op) : op(op) {}
+  };
+
   SmallPtrSet<Operation *, 8> seen;
-  SmallVector<std::pair<Operation *, bool>> worklist;
+  SmallVector<WorkItem> worklist;
+
+  auto addToWorklist = [&](Operation *outerOp) {
+    SmallDenseSet<Value> seenOperands;
+    auto &workItem = worklist.emplace_back(outerOp);
+    outerOp->walk([&](Operation *innerOp) {
+      for (auto operand : innerOp->getOperands()) {
+        // Skip operands that are defined within the operation itself.
+        if (!operand.getParentBlock()->getParentOp()->isProperAncestor(outerOp))
+          continue;
+
+        // Skip operands that we have already seen.
+        if (!seenOperands.insert(operand).second)
+          continue;
+
+        // Skip operands that we have already materialized or that should not
+        // be materialized at all.
+        if (materializedValues.contains(operand) || !shouldMaterialize(operand))
+          continue;
+
+        workItem.operands.push_back(operand);
+      }
+    });
+  };
+
   seen.insert(value.getDefiningOp());
-  worklist.push_back({value.getDefiningOp(), false});
+  addToWorklist(value.getDefiningOp());
 
   while (!worklist.empty()) {
-    auto &[op, operandsHandled] = worklist.back();
-    if (!operandsHandled) {
-      operandsHandled = true;
-      SmallDenseSet<Value> seenOperands;
-      Operation *outerOp = op;
-      bool loopDetected = false;
-      LLVM_DEBUG(llvm::dbgs() << "Operation " << *op << "\n");
-      op->walk([&](Operation *innerOp) {
-        for (auto operand : innerOp->getOperands()) {
-          // Skip operands that are defined within the outer operation.
-          LLVM_DEBUG(llvm::dbgs() << "- Checking operand " << operand << "\n");
-          if (!operand.getParentBlock()->getParentOp()->isProperAncestor(
-                  outerOp))
-            continue;
-          LLVM_DEBUG(llvm::dbgs() << "  - Materialize\n");
-
-          // Skip operands that we have already pushed onto the worklist.
-          if (!seenOperands.insert(operand).second)
-            continue;
-
-          // Skip operands that we have already materialized or that should not
-          // be materialized at all.
-          if (materializedValues.contains(operand) ||
-              !shouldMaterialize(operand))
-            continue;
-
-          // Break combinational loops.
-          auto *defOp = operand.getDefiningOp();
-          if (!seen.insert(defOp).second) {
-            defOp->emitError("combinational loop detected");
-            loopDetected = true;
-            continue;
-          }
-          worklist.push_back({defOp, false});
-        }
-      });
-      if (loopDetected)
+    auto &workItem = worklist.back();
+    if (!workItem.operands.empty()) {
+      auto operand = workItem.operands.pop_back_val();
+      if (materializedValues.contains(operand) || !shouldMaterialize(operand))
+        continue;
+      auto *defOp = operand.getDefiningOp();
+      if (!seen.insert(defOp).second) {
+        defOp->emitError("combinational loop detected");
         return {};
+      }
+      addToWorklist(defOp);
     } else {
-      auto *newOp = builder.clone(*op, materializedValues);
-      LLVM_DEBUG(llvm::dbgs() << "Cloned " << *newOp << "\n");
-      seen.erase(op);
+      builder.clone(*workItem.op, materializedValues);
+      seen.erase(workItem.op);
       worklist.pop_back();
     }
   }
@@ -323,9 +328,17 @@ LogicalResult ModuleLowering::lowerPrimaryOutputs() {
 }
 
 LogicalResult ModuleLowering::lowerStates() {
+  // Handle all memory read operations first such that all of them occur before
+  // the memory write operations. This is not ideal and should be changed once
+  // LegalizeStateUpdate has proper support for memory operations.
+  for (auto &op : llvm::make_early_inc_range(*moduleOp.getBodyBlock()))
+    if (auto memReadOp = dyn_cast<MemoryReadPortOp>(op))
+      if (failed(lowerState(memReadOp)))
+        return failure();
+
   for (auto &op : llvm::make_early_inc_range(*moduleOp.getBodyBlock())) {
     auto result = TypeSwitch<Operation *, LogicalResult>(&op)
-                      .Case<StateOp, MemoryOp, MemoryWriteOp, TapOp>(
+                      .Case<StateOp, MemoryOp, MemoryWritePortOp, TapOp>(
                           [&](auto op) { return lowerState(op); })
                       .Default(success());
     if (failed(result))
@@ -379,7 +392,7 @@ LogicalResult ModuleLowering::lowerState(StateOp stateOp) {
   for (auto input : inputs)
     materializedOperands.push_back(info.clock.materializeValue(input));
 
-  OpBuilder &nonResetBuilder = info.clock.builder;
+  OpBuilder nonResetBuilder = info.clock.builder;
   if (stateOp.getReset()) {
     auto materializedReset = info.clock.materializeValue(stateOp.getReset());
     auto ifOp = info.clock.builder.create<scf::IfOp>(stateOp.getLoc(),
@@ -430,7 +443,39 @@ LogicalResult ModuleLowering::lowerState(MemoryOp memOp) {
   return success();
 }
 
-LogicalResult ModuleLowering::lowerState(MemoryWriteOp memWriteOp) {
+static Value lowerMemoryReadPortOp(MemoryReadPortOp memReadOp,
+                                   OpBuilder &builder) {
+  // Lowering MemoryReadOp to LLVM inserts a conditional branch to only perform
+  // the read when the address is within bounds. Ideally, LLVM will be able to
+  // merge that check with the mux/condition here.
+  Value newRead;
+  if (memReadOp.getEnable()) {
+    Value read = builder.create<MemoryReadOp>(
+        memReadOp.getLoc(), memReadOp.getMemory(), memReadOp.getAddress());
+    Value zero = builder.create<hw::ConstantOp>(
+        memReadOp.getLoc(), memReadOp.getResult().getType(), 0);
+    newRead = builder.create<comb::MuxOp>(
+        memReadOp.getLoc(), memReadOp.getEnable(), read, zero, true);
+  } else {
+    newRead = builder.create<MemoryReadOp>(
+        memReadOp.getLoc(), memReadOp.getMemory(), memReadOp.getAddress());
+  }
+  memReadOp.replaceAllUsesWith(newRead);
+  builder.setInsertionPointAfter(memReadOp);
+  memReadOp.erase();
+  return newRead;
+}
+
+LogicalResult ModuleLowering::lowerState(MemoryReadPortOp memReadOp) {
+  auto info = getOrCreateClockLowering(memReadOp.getClock());
+
+  auto newRead = lowerMemoryReadPortOp(memReadOp, builder);
+  info.clock.materializeValue(newRead);
+
+  return success();
+}
+
+LogicalResult ModuleLowering::lowerState(MemoryWritePortOp memWriteOp) {
   // Get the clock tree and enable condition for this write port's clock. If the
   // port carries an explicit enable condition, fold that into the enable
   // provided by the clock gates in the port's clock tree.
@@ -447,8 +492,7 @@ LogicalResult ModuleLowering::lowerState(MemoryWriteOp memWriteOp) {
   if (mask) {
     mask = info.clock.materializeValue(mask);
     Value oldData = info.clock.builder.create<arc::MemoryReadOp>(
-        mask.getLoc(), data.getType(), memWriteOp.getMemory(), address,
-        info.clock.clock, info.enable);
+        mask.getLoc(), data.getType(), memWriteOp.getMemory(), address);
     Value allOnes = info.clock.builder.create<hw::ConstantOp>(
         mask.getLoc(), oldData.getType(), -1);
     Value negatedMask = info.clock.builder.create<comb::XorOp>(
@@ -467,29 +511,28 @@ LogicalResult ModuleLowering::lowerState(MemoryWriteOp memWriteOp) {
   // pass. Instead, we should just have memory read and write accesses all over
   // the place, then lower them into proper reads and writes, and let the
   // legalization pass insert any necessary temporaries.
-  SmallVector<Value> newReads;
-  for (auto read : memWriteOp.getReads()) {
-    if (auto readOp = read.getDefiningOp<MemoryReadOp>())
-      // HACK: This check for a constant clock is ugly. The read ops should
-      // instead be replicated for every clock domain that they are used in,
-      // and then dependencies should be tracked between reads and writes
-      // within that clock domain. Lack of a clock (comb mem) should be
-      // handled properly as well. Presence of a clock should group the read
-      // under that clock as expected, and write to a "read buffer" that can
-      // be read again by actual uses in different clock domains. LLVM
-      // lowering already has such a read buffer. Just need to formalize it.
-      if (!readOp.getClock().getDefiningOp<hw::ConstantOp>() &&
-          getOrCreateClockLowering(readOp.getClock()).clock.clock !=
-              info.clock.clock)
-        continue;
-    newReads.push_back(info.clock.materializeValue(read));
-  }
+  // SmallVector<Value> newReads;
+  // for (auto read : memWriteOp.getReads()) {
+  //   if (auto readOp = read.getDefiningOp<MemoryReadPortOp>())
+  //     // HACK: This check for a constant clock is ugly. The read ops should
+  //     // instead be replicated for every clock domain that they are used in,
+  //     // and then dependencies should be tracked between reads and writes
+  //     // within that clock domain. Lack of a clock (comb mem) should be
+  //     // handled properly as well. Presence of a clock should group the read
+  //     // under that clock as expected, and write to a "read buffer" that can
+  //     // be read again by actual uses in different clock domains. LLVM
+  //     // lowering already has such a read buffer. Just need to formalize it.
+  //     if (!readOp.getClock().getDefiningOp<hw::ConstantOp>() &&
+  //         getOrCreateClockLowering(readOp.getClock()).clock.clock !=
+  //             info.clock.clock)
+  //       continue;
+  //   newReads.push_back(info.clock.materializeValue(read));
+  // }
   // TODO: This just creates a write without any reads. Instead, there should be
   // a separate memory write op that we can lower to here which doesn't need to
   // track its reads, but will get legalized by the LegalizeStateUpdate pass.
   info.clock.builder.create<MemoryWriteOp>(
-      memWriteOp.getLoc(), memWriteOp.getMemory(), address, info.clock.clock,
-      info.enable, data, Value(), newReads);
+      memWriteOp.getLoc(), memWriteOp.getMemory(), address, info.enable, data);
   builder.setInsertionPointAfter(memWriteOp);
   memWriteOp.erase();
   return success();
@@ -515,6 +558,17 @@ LogicalResult ModuleLowering::lowerState(TapOp tapOp) {
 }
 
 LogicalResult ModuleLowering::cleanup() {
+  // Lower remaining MemoryReadPort ops to MemoryRead ops. This can occur when
+  // the fan-in of a MemoryReadPortOp contains another such operation and is
+  // materialized before the one in the fan-in as the MemoryReadPortOp is not
+  // marked as a fan-in blocking/termination operation in `shouldMaterialize`.
+  // Adding it there can lead to dominance issues which would then have to be
+  // resolved instead.
+  moduleOp->walk([this](MemoryReadPortOp memReadOp) {
+    builder.setInsertionPoint(memReadOp);
+    lowerMemoryReadPortOp(memReadOp, builder);
+  });
+
   // Establish an order among all operations (to avoid an O(n²) pathological
   // pattern with `moveBefore`) and replicate read operations into the blocks
   // where they have uses. The established order is used to create the read
@@ -593,7 +647,7 @@ void LowerStatePass::runOnOperation() {
 }
 
 LogicalResult LowerStatePass::runOnModule(HWModuleOp moduleOp) {
-  LLVM_DEBUG(llvm::dbgs() << "Lowering state in `" << moduleOp.moduleName()
+  LLVM_DEBUG(llvm::dbgs() << "Lowering state in `" << moduleOp.getModuleName()
                           << "`\n");
   ModuleLowering lowering(moduleOp, stats);
   lowering.addStorageArg();
@@ -630,7 +684,7 @@ LogicalResult LowerStatePass::runOnModule(HWModuleOp moduleOp) {
   moduleOp.getBodyBlock()->getTerminator()->erase();
   ImplicitLocOpBuilder builder(moduleOp.getLoc(), moduleOp);
   auto modelOp =
-      builder.create<ModelOp>(moduleOp.getLoc(), moduleOp.moduleNameAttr());
+      builder.create<ModelOp>(moduleOp.getLoc(), moduleOp.getModuleNameAttr());
   modelOp.getBody().takeBody(moduleOp.getBody());
   moduleOp->erase();
   return success();

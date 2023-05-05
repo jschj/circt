@@ -484,6 +484,10 @@ public:
   void visitStmt(PrintFOp op);
   void visitStmt(StopOp op);
   void visitStmt(WhenOp op);
+  void visitStmt(RefForceOp op);
+  void visitStmt(RefForceInitialOp op);
+  void visitStmt(RefReleaseOp op);
+  void visitStmt(RefReleaseInitialOp op);
 
 private:
   /// And a 1-bit value with the current condition.  If we are in the outer
@@ -528,6 +532,22 @@ void WhenOpVisitor::visitStmt(CoverOp op) {
 
 void WhenOpVisitor::visitStmt(WhenOp whenOp) {
   processWhenOp(whenOp, condition);
+}
+
+void WhenOpVisitor::visitStmt(RefForceOp op) {
+  op.getPredicateMutable().assign(andWithCondition(op, op.getPredicate()));
+}
+
+void WhenOpVisitor::visitStmt(RefForceInitialOp op) {
+  op.getPredicateMutable().assign(andWithCondition(op, op.getPredicate()));
+}
+
+void WhenOpVisitor::visitStmt(RefReleaseOp op) {
+  op.getPredicateMutable().assign(andWithCondition(op, op.getPredicate()));
+}
+
+void WhenOpVisitor::visitStmt(RefReleaseInitialOp op) {
+  op.getPredicateMutable().assign(andWithCondition(op, op.getPredicate()));
 }
 
 /// This is a common helper that is dispatched to by the concrete visitors.
@@ -658,17 +678,17 @@ LogicalResult ModuleVisitor::checkInitialization() {
 
     // Get the op which defines the sink, and emit an error.
     FieldRef dest = std::get<0>(destAndConnect);
+    auto loc = dest.getValue().getLoc();
     auto *definingOp = dest.getDefiningOp();
     if (auto mod = dyn_cast<FModuleLike>(definingOp))
-      mlir::emitError(definingOp->getLoc())
-          << "port \"" + getFieldName(dest).first +
-                 "\" not fully initialized in module \""
-          << mod.moduleName() << "\"";
+      mlir::emitError(loc) << "port \"" << getFieldName(dest).first
+                           << "\" not fully initialized in module \""
+                           << mod.getModuleName() << "\"";
     else
-      definingOp->emitError(
-          "sink \"" + getFieldName(dest).first +
-          "\" not fully initialized in module \"" +
-          definingOp->getParentOfType<FModuleLike>().moduleName() + "\"");
+      mlir::emitError(loc)
+          << "sink \"" << getFieldName(dest).first
+          << "\" not fully initialized in module \""
+          << definingOp->getParentOfType<FModuleLike>().getModuleName() << "\"";
     failed = true;
   }
   if (failed)

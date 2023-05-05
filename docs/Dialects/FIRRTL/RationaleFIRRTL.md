@@ -331,8 +331,8 @@ enabled.
 
 ## Symbols and Inner Symbols
 
-Symbols and Inner Symbols are documented in the [symbol
-rationale](RationaleSymbols.md).  This section documents how symbols are used,
+Symbols and Inner Symbols are documented in [Symbol
+Rationale](https://circt.llvm.org/docs/RationaleSymbols/).  This documents how symbols are used,
 their interaction with "Don't Touch", and the semantics imposed by them.
 
 Public Symbols indicate there are uses of an entity outside the analysis scope
@@ -548,9 +548,9 @@ instance inputs which may be also read from).  A value with `source` flow may be
 read from, but not written to.  A value with `duplex` flow may be read from or
 written to.
 
-For FIRRTL connects or partial connect statements, it follows that the
-left-hand-side must be `sink` or `duplex` and the right-hand-side must be
-`source`, `duplex`, or a port/instance `sink`.
+For FIRRTL connect statements, it follows that the left-hand-side must be `sink`
+or `duplex` and the right-hand-side must be `source`, `duplex`, or a
+port/instance `sink`.
 
 Flow is _not_ represented as a first-class type in CIRCT.  We instead provide
 utilities for computing flow when needed, e.g., for connect statement
@@ -568,6 +568,10 @@ The FIRRTL dialect has limited support for foreign types, i.e., types that are d
 The expected lowering for strict connects is for the connect to be eliminated and the right-hand-side source value of the connect being instead materialized in all places where the left hand side is used. Basically we want wires and connects to disappear, and all places where the wire is "read" should instead read the value that was driven onto the wire.
 
 The reason we provide this foreign type support is to allow for partial lowering of FIRRTL to HW and other dialects. Passes might lower a subset of types and operations to the target dialect and we need a mechanism to have the lowered values be passed around the FIRRTL module hierarchy untouched alongside the FIRRTL ops that are yet to be lowered.
+
+### Const Types
+
+FIRRTL hardware types can be specified as `const`, meaning they can only be assigned compile-time constant values or values of other `const` types.
 
 ## Operations
 
@@ -642,9 +646,7 @@ conditions for macro replacement are as follows:
 1. `–replSeqMem` option is passed and
 2. `readLatency == 1`  and
 3. `writeLatency == 1` and
-4. `numWritePorts + numReadWritePorts == 1` and
-5. `numReadPorts <= 1` and
-6. `width(data) > 0`
+4. `width(data) > 0`
 
 Any `MemOp` not satisfying the above conditions is lowered to Register vector.
 

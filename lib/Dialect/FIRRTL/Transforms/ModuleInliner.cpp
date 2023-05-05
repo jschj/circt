@@ -330,8 +330,8 @@ public:
 
   /// Return true if this NLA has a root that originates from a specific module.
   bool hasRoot(FModuleLike mod) {
-    return (isDead() && nla.root() == mod.moduleNameAttr()) ||
-           rootSet.contains(mod.moduleNameAttr());
+    return (isDead() && nla.root() == mod.getModuleNameAttr()) ||
+           rootSet.contains(mod.getModuleNameAttr());
   }
 
   /// Return true if either this NLA is rooted at modName, or is retoped to it.
@@ -562,7 +562,7 @@ private:
   /// the target, and does not trigger inlining on the target itself.
   void inlineInto(StringRef prefix, OpBuilder &b, IRMapping &mapper,
                   BackedgeBuilder &beb, SmallVectorImpl<Backedge> &edges,
-                  FModuleOp target,
+                  FModuleOp target, FModuleOp inlineToParent,
                   DenseMap<Attribute, Attribute> &symbolRenames,
                   ModuleNamespace &moduleNamespace);
 
@@ -670,7 +670,8 @@ bool Inliner::rename(StringRef prefix, Operation *op,
         auto &mnla = nlaMap[sym.getAttr()];
         if (!doesNLAMatchCurrentPath(mnla.getNLA()))
           continue;
-        mnla.setInnerSym(moduleNamespace.module.moduleNameAttr(), newSymAttr);
+        mnla.setInnerSym(moduleNamespace.module.getModuleNameAttr(),
+                         newSymAttr);
       }
       // Indicate symbol was changed.
       return true;
@@ -684,6 +685,12 @@ bool Inliner::renameInstance(
     StringRef prefix, InstanceOp oldInst, InstanceOp newInst,
     ModuleNamespace &moduleNamespace,
     const DenseMap<Attribute, Attribute> &symbolRenames) {
+  // Add this instance to the activeHierpaths. This ensures that NLAs that this
+  // instance participates in will be updated correctly.
+  auto parentActivePaths = activeHierpaths;
+  if (auto instSym = getInnerSymName(oldInst))
+    setActiveHierPaths(oldInst->getParentOfType<FModuleOp>().getNameAttr(),
+                       instSym);
   // List of HierPathOps that are valid based on the InstanceOp being inlined
   // and the InstanceOp which is being replaced after inlining. That is the set
   // of HierPathOps that is common between these two.
@@ -734,8 +741,8 @@ bool Inliner::renameInstance(
         continue;
       auto &mnla = nlaMap[nla];
       assert(newInnerRef.getModule() ==
-             moduleNamespace.module.moduleNameAttr());
-      mnla.setInnerSym(moduleNamespace.module.moduleNameAttr(), newSymAttr);
+             moduleNamespace.module.getModuleNameAttr());
+      mnla.setInnerSym(moduleNamespace.module.getModuleNameAttr(), newSymAttr);
     }
   }
 
@@ -750,6 +757,7 @@ bool Inliner::renameInstance(
         nlaList[en.index()] = newSym.cast<StringAttr>();
     }
   }
+  activeHierpaths = std::move(parentActivePaths);
   return symbolChanged;
 }
 
@@ -790,7 +798,7 @@ void Inliner::mapPortsToWires(StringRef prefix, OpBuilder &b, IRMapping &mapper,
           continue;
         // Update any NLAs with the new symbol name.
         if (oldSym != newSym)
-          mnla.setInnerSym(moduleNamespace.module.moduleNameAttr(), newSym);
+          mnla.setInnerSym(moduleNamespace.module.getModuleNameAttr(), newSym);
         // If all paths of the NLA have been inlined, make it local.
         if (mnla.isLocal() || localSymbols.count(sym.getAttr()))
           anno.removeMember("circt.nonlocal");
@@ -801,10 +809,13 @@ void Inliner::mapPortsToWires(StringRef prefix, OpBuilder &b, IRMapping &mapper,
     Value wire =
         TypeSwitch<FIRRTLType, Value>(type)
             .Case<FIRRTLBaseType>([&](auto base) {
-              return b.create<WireOp>(
-                  target.getLoc(), base, (prefix + portInfo[i].getName()).str(),
-                  NameKindEnum::DroppableName,
-                  ArrayAttr::get(context, newAnnotations), newSym);
+              return b
+                  .create<WireOp>(target.getLoc(), base,
+                                  (prefix + portInfo[i].getName()).str(),
+                                  NameKindEnum::DroppableName,
+                                  ArrayAttr::get(context, newAnnotations),
+                                  newSym)
+                  .getResult();
             })
             .Case<RefType>([&](auto refty) {
               // Symbols and annotations are not allowed, warn if dropping.
@@ -868,8 +879,8 @@ void Inliner::cloneAndRename(
     assert(newOpToRename);
     // TODO: If want to work before ExpandWhen's, more work needed!
     // Handle what we can for now.
-    assert(origOp == &op || !isa<InstanceOp>(origOp) &&
-                                "Cannot handle instances not at top-level");
+    assert((origOp == &op || !isa<InstanceOp>(origOp)) &&
+           "Cannot handle instances not at top-level");
 
     // Instances require extra handling to update HierPathOp's if their symbols
     // change.
@@ -1017,7 +1028,7 @@ void Inliner::flattenInstances(FModuleOp module) {
 // NOLINTNEXTLINE(misc-no-recursion)
 void Inliner::inlineInto(StringRef prefix, OpBuilder &b, IRMapping &mapper,
                          BackedgeBuilder &beb, SmallVectorImpl<Backedge> &edges,
-                         FModuleOp target,
+                         FModuleOp target, FModuleOp inlineToParent,
                          DenseMap<Attribute, Attribute> &symbolRenames,
                          ModuleNamespace &moduleNamespace) {
   auto moduleName = target.getNameAttr();
@@ -1074,7 +1085,9 @@ void Inliner::inlineInto(StringRef prefix, OpBuilder &b, IRMapping &mapper,
     if (!rootMap[childModule.getNameAttr()].empty()) {
       for (auto sym : rootMap[childModule.getNameAttr()]) {
         auto &mnla = nlaMap[sym];
-        sym = mnla.reTop(target);
+        // Retop to the new parent, which is the topmost module (and not
+        // immediate parent) in case of recursive inlining.
+        sym = mnla.reTop(inlineToParent);
         StringAttr instSym = getInnerSymName(instance);
         if (!instSym) {
           instSym = StringAttr::get(
@@ -1107,7 +1120,7 @@ void Inliner::inlineInto(StringRef prefix, OpBuilder &b, IRMapping &mapper,
                   moduleNamespace);
     } else {
       inlineInto(nestedPrefix, b, mapper, beb, edges, childModule,
-                 symbolRenames, moduleNamespace);
+                 inlineToParent, symbolRenames, moduleNamespace);
     }
     currentPath.pop_back();
     activeHierpaths = parentActivePaths;
@@ -1203,8 +1216,10 @@ void Inliner::inlineInstances(FModuleOp parent) {
       flattenInto(nestedPrefix, b, mapper, beb, edges, target, {},
                   moduleNamespace);
     } else {
-      inlineInto(nestedPrefix, b, mapper, beb, edges, target, symbolRenames,
-                 moduleNamespace);
+      // Recursively inline all the child modules under `parent`, that are
+      // marked to be inlined.
+      inlineInto(nestedPrefix, b, mapper, beb, edges, target, parent,
+                 symbolRenames, moduleNamespace);
     }
     currentPath.pop_back();
     activeHierpaths = parentActivePaths;
@@ -1304,7 +1319,7 @@ void Inliner::run() {
 
   // Mark the top module as live, so it doesn't get deleted.
   for (auto module : circuit.getOps<FModuleLike>()) {
-    if (!cast<hw::HWModuleLike>(*module).isPublic())
+    if (!module.isPublic())
       continue;
     liveModules.insert(module);
     if (isa<FModuleOp>(module))
@@ -1332,7 +1347,7 @@ void Inliner::run() {
            circuit.getBodyBlock()->getOps<FModuleLike>())) {
     if (liveModules.count(mod))
       continue;
-    for (auto nla : rootMap[mod.moduleNameAttr()])
+    for (auto nla : rootMap[mod.getModuleNameAttr()])
       nlaMap[nla].markDead();
     mod.erase();
   }
@@ -1341,7 +1356,7 @@ void Inliner::run() {
   // remain as they should have been processed and removed.
   for (auto mod : circuit.getBodyBlock()->getOps<FModuleLike>()) {
     if (shouldInline(mod)) {
-      assert(cast<hw::HWModuleLike>(*mod).isPublic() &&
+      assert(mod.isPublic() &&
              "non-public module with inline annotation still present");
       AnnotationSet::removeAnnotations(mod, inlineAnnoClass);
     }

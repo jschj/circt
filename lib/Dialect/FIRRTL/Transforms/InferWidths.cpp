@@ -1271,7 +1271,7 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
     else
       allWidthsKnown = false;
   }
-  if (allWidthsKnown && !isa<FConnectLike, AttachOp>(op))
+  if (allWidthsKnown && !isa<FConnectLike, AttachOp, UninferredWidthCastOp>(op))
     return success();
 
   // Actually generate the necessary constraint expressions.
@@ -1336,7 +1336,7 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
       .Case<NodeOp>([&](auto op) {
         // Nodes have the same type as their input.
         unifyTypes(FieldRef(op.getResult(), 0), FieldRef(op.getInput(), 0),
-                   op.getType());
+                   op.getResult().getType());
       })
 
       // Aggregate Values
@@ -1351,6 +1351,23 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
         // of the vector, which has a field ID of 1.
         unifyTypes(FieldRef(op.getResult(), 0), FieldRef(op.getInput(), 1),
                    op.getType());
+      })
+      .Case<SubtagOp>([&](auto op) {
+        auto enumType = op.getInput().getType();
+        auto fieldID = enumType.getFieldID(op.getFieldIndex());
+        unifyTypes(FieldRef(op.getResult(), 0),
+                   FieldRef(op.getInput(), fieldID), op.getType());
+      })
+
+      .Case<RefSubOp>([&](RefSubOp op) {
+        uint64_t fieldID = TypeSwitch<FIRRTLBaseType, uint64_t>(
+                               op.getInput().getType().getType())
+                               .Case<FVectorType>([](auto _) { return 1; })
+                               .Case<BundleType>([&](auto type) {
+                                 return type.getFieldID(op.getIndex());
+                               });
+        unifyTypes(FieldRef(op.getResult(), 0),
+                   FieldRef(op.getInput(), fieldID), op.getType());
       })
 
       // Arithmetic and Logical Binary Primitives
@@ -1471,10 +1488,23 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
         constrainTypes(sel, solver.known(1));
         maximumOfTypes(op.getResult(), op.getHigh(), op.getLow());
       })
-
-      // Handle the various connect statements that imply a type constraint.
-      .Case<FConnectLike>(
+      .Case<UninferredWidthCastOp>([&](auto op) {
+        if (hasUninferredWidth(op.getResult().getType()))
+          declareVars(op.getResult(), op.getLoc());
+        constrainTypes(op.getResult(), op.getInput());
+      })
+      .Case<ConnectOp>(
           [&](auto op) { constrainTypes(op.getDest(), op.getSrc()); })
+      .Case<RefDefineOp>(
+          [&](auto op) { constrainTypes(op.getDest(), op.getSrc()); })
+      // StrictConnect is an identify constraint
+      .Case<StrictConnectOp>([&](auto op) {
+        constrainTypes(op.getDest(), op.getSrc());
+        constrainTypes(op.getSrc(), op.getDest());
+        //                unifyTypes(FieldRef(op.getDest(), 0),
+        //                FieldRef(op.getSrc(), 0),
+        //           op.getDest().getType().template cast<FIRRTLType>());
+      })
       .Case<AttachOp>([&](auto op) {
         // Attach connects multiple analog signals together. All signals must
         // have the same bit width. Signals without bit width inherit from the
@@ -1611,6 +1641,12 @@ LogicalResult InferenceMapping::mapOperation(Operation *op) {
         mappingFailed = true;
       });
 
+  // Forceable declarations should have the ref constrained to data result.
+  if (auto fop = dyn_cast<Forceable>(op); fop && fop.isForceable()) {
+    declareVars(fop.getDataRef(), fop.getLoc());
+    constrainTypes(fop.getDataRef(), fop.getDataRaw());
+  }
+
   return failure(mappingFailed);
 }
 
@@ -1649,6 +1685,10 @@ void InferenceMapping::declareVars(Value value, Location loc, bool isDerived) {
       declare(vecType.getElementType());
       // Skip past the rest of the elements
       fieldID = save + vecType.getMaxFieldID();
+    } else if (auto enumType = type.dyn_cast<FEnumType>()) {
+      fieldID++;
+      for (auto &element : enumType.getElements())
+        declare(element.type);
     } else {
       llvm_unreachable("Unknown type inside a bundle!");
     }
@@ -1674,6 +1714,10 @@ void InferenceMapping::maximumOfTypes(Value result, Value rhs, Value lhs) {
       if (vecType.getNumElements() > 0)
         maximize(vecType.getElementType());
       fieldID = save + vecType.getMaxFieldID();
+    } else if (auto enumType = type.dyn_cast<FEnumType>()) {
+      fieldID++;
+      for (auto &element : enumType.getElements())
+        maximize(element.type);
     } else if (type.isGround()) {
       auto *e = solver.max(getExpr(FieldRef(rhs, fieldID)),
                            getExpr(FieldRef(lhs, fieldID)));
@@ -1719,6 +1763,10 @@ void InferenceMapping::constrainTypes(Value larger, Value smaller) {
             constrain(vecType.getElementType(), larger, smaller);
           }
           fieldID = save + vecType.getMaxFieldID();
+        } else if (auto enumType = type.dyn_cast<FEnumType>()) {
+          fieldID++;
+          for (auto &element : enumType.getElements())
+            constrain(element.type, larger, smaller);
         } else if (type.isGround()) {
           // Leaf element, look up their expressions, and create the constraint.
           constrainTypes(getExpr(FieldRef(larger, fieldID)),
@@ -1816,6 +1864,10 @@ void InferenceMapping::unifyTypes(FieldRef lhs, FieldRef rhs, FIRRTLType type) {
         unify(vecType.getElementType());
       }
       fieldID = save + vecType.getMaxFieldID();
+    } else if (auto enumType = type.dyn_cast<FEnumType>()) {
+      fieldID++;
+      for (auto &element : enumType.getElements())
+        unify(element.type);
     } else {
       llvm_unreachable("Unknown type inside a bundle!");
     }
@@ -1939,8 +1991,41 @@ bool InferenceTypeUpdate::updateOperation(Operation *op) {
     return anyChanged;
   }
 
+  if (auto cast = dyn_cast<UninferredWidthCastOp>(op)) {
+    auto lhs = cast.getResult();
+    auto rhs = cast.getInput();
+    auto lhsType = lhs.getType().dyn_cast<FIRRTLBaseType>();
+    auto rhsType = rhs.getType().dyn_cast<FIRRTLBaseType>();
+
+    auto lhsWidth = lhsType.getBitWidthOrSentinel();
+    auto rhsWidth = rhsType.getBitWidthOrSentinel();
+    if (lhsWidth < rhsWidth) {
+      OpBuilder builder(op);
+      auto trunc = builder.createOrFold<TailPrimOp>(cast.getLoc(), rhs,
+                                                    rhsWidth - lhsWidth);
+      if (rhsType.isa<SIntType>())
+        trunc =
+            builder.createOrFold<AsSIntPrimOp>(cast.getLoc(), lhsType, trunc);
+
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Truncating RHS to " << lhsType << " in " << cast << "\n");
+      lhs.replaceAllUsesWith(trunc);
+    } else if (lhsWidth > rhsWidth) {
+      OpBuilder builder(op);
+      auto extend =
+          builder.createOrFold<PadPrimOp>(cast.getLoc(), rhs, lhsWidth);
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Extending RHS to " << lhsType << " in " << cast << "\n");
+      lhs.replaceAllUsesWith(extend);
+    } else {
+      LLVM_DEBUG(llvm::dbgs() << "NOOP " << cast << "\n");
+      lhs.replaceAllUsesWith(rhs);
+    }
+    return anyChanged;
+  }
+
   // If this is a module, update its ports.
-  else if (auto module = dyn_cast<FModuleOp>(op)) {
+  if (auto module = dyn_cast<FModuleOp>(op)) {
     // Update the block argument types.
     bool argsChanged = false;
     SmallVector<Attribute> argTypes;
@@ -1966,12 +2051,15 @@ bool InferenceTypeUpdate::updateOperation(Operation *op) {
 static FIRRTLBaseType resizeType(FIRRTLBaseType type, uint32_t newWidth) {
   auto *context = type.getContext();
   return TypeSwitch<FIRRTLBaseType, FIRRTLBaseType>(type)
-      .Case<UIntType>(
-          [&](auto type) { return UIntType::get(context, newWidth); })
-      .Case<SIntType>(
-          [&](auto type) { return SIntType::get(context, newWidth); })
-      .Case<AnalogType>(
-          [&](auto type) { return AnalogType::get(context, newWidth); })
+      .Case<UIntType>([&](auto type) {
+        return UIntType::get(context, newWidth, type.isConst());
+      })
+      .Case<SIntType>([&](auto type) {
+        return SIntType::get(context, newWidth, type.isConst());
+      })
+      .Case<AnalogType>([&](auto type) {
+        return AnalogType::get(context, newWidth, type.isConst());
+      })
       .Default([&](auto type) { return type; });
 }
 
@@ -1993,7 +2081,8 @@ bool InferenceTypeUpdate::updateValue(Value value) {
     SmallVector<Type, 2> types;
     auto res =
         op.inferReturnTypes(op->getContext(), op->getLoc(), op->getOperands(),
-                            op->getAttrDictionary(), op->getRegions(), types);
+                            op->getAttrDictionary(), op->getPropertiesStorage(),
+                            op->getRegions(), types);
     if (failed(res)) {
       anyFailed = true;
       return false;
@@ -2030,20 +2119,27 @@ bool InferenceTypeUpdate::updateValue(Value value) {
         elements.emplace_back(element.name, element.isFlip,
                               updateBase(element.type));
       }
-      return BundleType::get(context, elements);
+      return BundleType::get(context, elements, bundleType.isConst());
     } else if (auto vecType = type.dyn_cast<FVectorType>()) {
       fieldID++;
       auto save = fieldID;
       // TODO: this should recurse into the element type of 0 length vectors and
       // set any unknown width to 0.
       if (vecType.getNumElements() > 0) {
-        auto newType = FVectorType::get(updateBase(vecType.getElementType()),
-                                        vecType.getNumElements());
+        auto newType =
+            FVectorType::get(updateBase(vecType.getElementType()),
+                             vecType.getNumElements(), vecType.isConst());
         fieldID = save + vecType.getMaxFieldID();
         return newType;
       }
       // If this is a 0 length vector return the original type.
       return type;
+    } else if (auto enumType = type.dyn_cast<FEnumType>()) {
+      fieldID++;
+      llvm::SmallVector<FEnumType::EnumElement> elements;
+      for (auto &element : enumType.getElements())
+        elements.emplace_back(element.name, updateBase(element.type));
+      return FEnumType::get(context, elements, enumType.isConst());
     }
     llvm_unreachable("Unknown type inside a bundle!");
   };

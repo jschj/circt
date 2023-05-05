@@ -107,10 +107,6 @@ class PrefixModulesPass : public PrefixModulesBase<PrefixModulesPass> {
   /// This is a map from a module name to new prefixes to be applied.
   PrefixMap prefixMap;
 
-  /// Map prefix to group ID.
-  /// Store strings in the map, they may not stay alive.
-  llvm::StringMap<uint32_t> prefixIdMap;
-
   /// A map of Grand Central interface ID to prefix.
   DenseMap<Attribute, std::string> interfacePrefixMap;
 
@@ -164,13 +160,6 @@ void PrefixModulesPass::removeDeadAnnotations(StringAttr moduleName,
 /// any referenced module in the prefix map.
 void PrefixModulesPass::renameModuleBody(std::string prefix, FModuleOp module) {
   auto *context = module.getContext();
-  uint32_t groupID = 0;
-  auto iter = prefixIdMap.find(prefix);
-  if (iter == prefixIdMap.end()) {
-    groupID = prefixIdMap.size() + 1;
-    prefixIdMap[prefix] = groupID;
-  } else
-    groupID = iter->second;
 
   // If we are renaming the body of this module, we need to mark that we have
   // changed the IR. If we are prefixing with the empty string, then nothing has
@@ -189,10 +178,12 @@ void PrefixModulesPass::renameModuleBody(std::string prefix, FModuleOp module) {
     removeDeadAnnotations(thisMod, op);
 
     if (auto memOp = dyn_cast<MemOp>(op)) {
-      // Memories will be turned into modules and should be prefixed.
-      memOp.setNameAttr(StringAttr::get(context, prefix + memOp.getName()));
-      memOp.setGroupIDAttr(IntegerAttr::get(
-          IntegerType::get(context, 32, IntegerType::Unsigned), groupID));
+      StringAttr newPrefix;
+      if (auto oldPrefix = memOp->getAttrOfType<StringAttr>("prefix"))
+        newPrefix = StringAttr::get(context, prefix + oldPrefix.getValue());
+      else
+        newPrefix = StringAttr::get(context, prefix);
+      memOp->setAttr("prefix", newPrefix);
     } else if (auto instanceOp = dyn_cast<InstanceOp>(op)) {
       auto target = dyn_cast<FModuleLike>(
           *instanceGraph->getReferencedModule(instanceOp));
@@ -211,12 +202,12 @@ void PrefixModulesPass::renameModuleBody(std::string prefix, FModuleOp module) {
       }
 
       // Record that we must prefix the target module with the current prefix.
-      recordPrefix(prefixMap, target.moduleName(), prefix);
+      recordPrefix(prefixMap, target.getModuleName(), prefix);
 
       // Fixup this instance op to use the prefixed module name.  Note that the
       // referenced FModuleOp will be renamed later.
       auto newTarget = StringAttr::get(context, prefix + getPrefix(target) +
-                                                    target.moduleName());
+                                                    target.getModuleName());
       AnnotationSet instAnnos(instanceOp);
       // If the instance has HierPathOp, then update its module name also.
       // There can be multiple HierPathOps attached to the instance op.
@@ -438,7 +429,7 @@ void PrefixModulesPass::runOnOperation() {
   auto mainModule = instanceGraph->getTopLevelModule();
   auto prefix = getPrefix(mainModule);
   if (!prefix.empty()) {
-    auto oldModName = mainModule.moduleNameAttr();
+    auto oldModName = mainModule.getModuleNameAttr();
     auto newMainModuleName =
         StringAttr::get(context, (prefix + circuitOp.getName()).str());
     circuitOp.setNameAttr(newMainModuleName);
@@ -468,7 +459,6 @@ void PrefixModulesPass::runOnOperation() {
   prefixGrandCentralInterfaces();
 
   prefixMap.clear();
-  prefixIdMap.clear();
   interfacePrefixMap.clear();
   if (!anythingChanged)
     markAllAnalysesPreserved();

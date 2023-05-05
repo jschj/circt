@@ -163,10 +163,29 @@ def EnumConstantOp : HWOp<"enum.constant", [Pure, ConstantLike,
   let results = (outs EnumType:$result);
   let hasCustomAssemblyFormat = 1;
   let hasFolder = true;
-
+  let hasVerifier = true;
   let builders = [
     OpBuilder<(ins "hw::EnumFieldAttr":$field)>,
   ];
+}
+
+def EnumCmpOp : HWOp<"enum.cmp", [Pure]> {
+  let summary = "Compare two values of an enumeration";
+  let description = [{
+    This operation compares two values with the same canonical enumeration
+    type, returning 0 if they are different, and 1 if they are the same.
+
+    Example:
+    ```mlir
+      %enumcmp = hw.enum.cmp %A, %B : !hw.enum<A, B, C>, !hw.enum<A, B, C>
+    ```
+  }];
+  let arguments = (ins EnumType:$lhs, EnumType:$rhs);
+  let results = (outs I1:$result);
+  let hasVerifier = true;
+  let assemblyFormat = [{
+    $lhs `,` $rhs attr-dict `:` qualified(type($lhs)) `,` qualified(type($rhs))
+  }];
 }
 
 #endif // CIRCT_DIALECT_HW_HWMISCOPS_TD

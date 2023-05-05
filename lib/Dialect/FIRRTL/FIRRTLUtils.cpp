@@ -44,8 +44,8 @@ void circt::firrtl::emitConnect(ImplicitLocOpBuilder &builder, Value dst,
   }
 
   // If the types are the exact same we can just connect them.
-  // Strict connect does not allow uninferred widths.
-  if (dstType == srcType && !dstType.hasUninferredWidth()) {
+  if (dstType == srcType && dstType.isPassive() &&
+      !dstType.hasUninferredWidth()) {
     builder.create<StrictConnectOp>(dst, src);
     return;
   }
@@ -88,15 +88,22 @@ void circt::firrtl::emitConnect(ImplicitLocOpBuilder &builder, Value dst,
     return;
   }
 
+  if ((dstType.hasUninferredReset() || srcType.hasUninferredReset()) &&
+      dstType != srcType) {
+    src = builder.create<UninferredResetCastOp>(dstType, src);
+    srcType = dstType;
+  }
+
+  // Be sure uint, uint -> uint, (uir uint) since we are changing extneding
+  // connect to identity.
+  if (dstType.hasUninferredWidth() || srcType.hasUninferredWidth()) {
+    src = builder.create<UninferredWidthCastOp>(dstType, src);
+    srcType = dstType;
+  }
+
   // Handle ground types with possibly uninferred widths.
   auto dstWidth = dstType.getBitWidthOrSentinel();
   auto srcWidth = srcType.getBitWidthOrSentinel();
-  if (dstWidth < 0 || srcWidth < 0) {
-    // If one of these types has an uninferred width, we connect them with a
-    // regular connect operation.
-    builder.create<ConnectOp>(dst, src);
-    return;
-  }
 
   // The source must be extended or truncated.
   if (dstWidth < srcWidth) {
@@ -115,10 +122,8 @@ void circt::firrtl::emitConnect(ImplicitLocOpBuilder &builder, Value dst,
 
   // Strict connect requires the types to be completely equal, including
   // connecting uint<1> to abstract reset types.
-  if (dstType == src.getType())
-    builder.create<StrictConnectOp>(dst, src);
-  else
-    builder.create<ConnectOp>(dst, src);
+  assert("Connect Types are equal" && dstType == src.getType());
+  builder.create<StrictConnectOp>(dst, src);
 }
 
 IntegerAttr circt::firrtl::getIntAttr(Type type, const APInt &value) {
@@ -597,6 +602,12 @@ void circt::firrtl::walkGroundTypes(
             f(f, vector.getElementType());
           }
         })
+        .template Case<FEnumType>([&](FEnumType fenum) {
+          for (size_t i = 0, e = fenum.getNumElements(); i < e; ++i) {
+            fieldID++;
+            f(f, fenum.getElementType(i));
+          }
+        })
         .Default([&](FIRRTLBaseType groundType) {
           assert(groundType.isGround() &&
                  "only ground types are expected here");
@@ -800,7 +811,7 @@ Type circt::firrtl::lowerType(Type type) {
   // Ignore flip types.
   firType = firType.getPassiveType();
 
-  if (BundleType bundle = firType.dyn_cast<BundleType>()) {
+  if (auto bundle = firType.dyn_cast<BundleType>()) {
     mlir::SmallVector<hw::StructType::FieldInfo, 8> hwfields;
     for (auto element : bundle) {
       Type etype = lowerType(element.type);
@@ -810,11 +821,35 @@ Type circt::firrtl::lowerType(Type type) {
     }
     return hw::StructType::get(type.getContext(), hwfields);
   }
-  if (FVectorType vec = firType.dyn_cast<FVectorType>()) {
+  if (auto vec = firType.dyn_cast<FVectorType>()) {
     auto elemTy = lowerType(vec.getElementType());
     if (!elemTy)
       return {};
     return hw::ArrayType::get(elemTy, vec.getNumElements());
+  }
+  if (auto fenum = firType.dyn_cast<FEnumType>()) {
+    mlir::SmallVector<hw::UnionType::FieldInfo, 8> hwfields;
+    SmallVector<Attribute> names;
+    bool simple = true;
+    for (auto element : fenum) {
+      Type etype = lowerType(element.type);
+      if (!etype)
+        return {};
+      hwfields.push_back(hw::UnionType::FieldInfo{element.name, etype, 0});
+      names.push_back(element.name);
+      if (!element.type.isa<UIntType>() ||
+          element.type.getBitWidthOrSentinel() != 0)
+        simple = false;
+    }
+    auto tagTy = hw::EnumType::get(type.getContext(),
+                                   ArrayAttr::get(type.getContext(), names));
+    if (simple)
+      return tagTy;
+    auto bodyTy = hw::UnionType::get(type.getContext(), hwfields);
+    hw::StructType::FieldInfo fields[2] = {
+        {StringAttr::get(type.getContext(), "tag"), tagTy},
+        {StringAttr::get(type.getContext(), "body"), bodyTy}};
+    return hw::StructType::get(type.getContext(), fields);
   }
 
   auto width = firType.getBitWidthOrSentinel();

@@ -1618,7 +1618,7 @@ void InstanceOp::setResultName(size_t i, StringAttr name) {
 /// Suggest a name for each result value based on the saved result names
 /// attribute.
 void InstanceOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
-  instance_like_impl::getAsmResultNames(setNameFn, instanceName(),
+  instance_like_impl::getAsmResultNames(setNameFn, getInstanceName(),
                                         getResultNames(), getResults());
 }
 
@@ -2244,9 +2244,38 @@ void EnumConstantOp::getAsmResultNames(
   setNameFn(getResult(), getField().getField().str());
 }
 
+void EnumConstantOp::build(OpBuilder &builder, OperationState &odsState,
+                           EnumFieldAttr field) {
+  return build(builder, odsState, field.getType().getValue(), field);
+}
+
 OpFoldResult EnumConstantOp::fold(FoldAdaptor adaptor) {
   assert(adaptor.getOperands().empty() && "constant has no operands");
   return getFieldAttr();
+}
+
+LogicalResult EnumConstantOp::verify() {
+  auto fieldAttr = getFieldAttr();
+  auto fieldType = fieldAttr.getType().getValue();
+  // This check ensures that we are using the exact same type, without looking
+  // through type aliases.
+  if (fieldType != getType())
+    emitOpError("return type ")
+        << getType() << " does not match attribute type " << fieldAttr;
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// EnumCmpOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult EnumCmpOp::verify() {
+  // Compare the canonical types.
+  auto lhsType = type_cast<EnumType>(getLhs().getType());
+  auto rhsType = type_cast<EnumType>(getRhs().getType());
+  if (rhsType != lhsType)
+    emitOpError("types do not match");
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -2640,6 +2669,15 @@ ParseResult UnionExtractOp::parse(OpAsmParser &parser, OperationState &result) {
 
 void UnionExtractOp::print(OpAsmPrinter &printer) {
   printExtractOp(printer, *this);
+}
+
+LogicalResult UnionExtractOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attrs, mlir::OpaqueProperties properties,
+    mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
+  results.push_back(cast<UnionType>(getCanonicalType(operands[0].getType()))
+                        .getFieldType(attrs.getAs<StringAttr>("field")));
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -3069,7 +3107,7 @@ LogicalResult HierPathOp::verifyInnerRefs(hw::InnerRefNamespace &ns) {
       return emitOpError() << " module: " << innerRef.getModule()
                            << " does not contain any instance with symbol: "
                            << innerRef.getName();
-    expectedModuleName = instOp.referencedModuleNameAttr();
+    expectedModuleName = instOp.getReferencedModuleNameAttr();
   }
   // The instance path has been verified. Now verify the last element.
   auto leafRef = getNamepath()[getNamepath().size() - 1];

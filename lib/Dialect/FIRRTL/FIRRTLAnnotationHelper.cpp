@@ -206,8 +206,17 @@ firrtl::resolveEntities(TokenAnnoTarget path, CircuitOp circuit,
   } else {
     ref = cache.lookup(mod, path.name);
     if (!ref) {
+      mlir::emitError(circuit.getLoc()) << "cannot find name '" << path.name
+                                        << "' in " << mod.getModuleName();
+      return {};
+    }
+    // AnnoTarget::getType() is not safe (CHIRRTL ops crash, null if instance),
+    // avoid. For now, only references in ports can be targets, check that.
+    // TODO: containsReference().
+    if (ref.isa<PortAnnoTarget>() && isa<RefType>(ref.getType())) {
       mlir::emitError(circuit.getLoc())
-          << "cannot find name '" << path.name << "' in " << mod.moduleName();
+          << "cannot target reference-type '" << path.name << "' in "
+          << mod.getModuleName();
       return {};
     }
   }
@@ -240,8 +249,15 @@ firrtl::resolveEntities(TokenAnnoTarget path, CircuitOp circuit,
         }
       if (!ref) {
         mlir::emitError(circuit.getLoc())
-            << "!cannot find port '" << field << "' in module "
-            << target.moduleName();
+            << "cannot find port '" << field << "' in module "
+            << target.getModuleName();
+        return {};
+      }
+      // TODO: containsReference().
+      if (isa<RefType>(ref.getType())) {
+        mlir::emitError(circuit.getLoc())
+            << "annotation cannot target reference-type port '" << field
+            << "' in module " << target.getModuleName();
         return {};
       }
       component = component.drop_front();
@@ -336,9 +352,7 @@ InstanceOp firrtl::addPortsToModule(
   if (targetCaches)
     targetCaches->insertPort(mod, portNo);
   // Now update all the instances of `mod`.
-  for (auto *use : instancePathcache.instanceGraph
-                       .lookup(cast<hw::HWModuleLike>((Operation *)mod))
-                       ->uses()) {
+  for (auto *use : instancePathcache.instanceGraph.lookup(mod)->uses()) {
     InstanceOp useInst = cast<InstanceOp>(use->getInstance());
     auto clonedInst = useInst.cloneAndInsertPorts({{portNo, portInfo}});
     if (useInst == instOnPath)
@@ -360,7 +374,7 @@ InstanceOp firrtl::addPortsToModule(
 void AnnoTargetCache::gatherTargets(FModuleLike mod) {
   // Add ports
   for (const auto &p : llvm::enumerate(mod.getPorts()))
-    targets.insert({p.value().name, PortAnnoTarget(mod, p.index())});
+    insertPort(mod, p.index());
 
   // And named things
   mod.walk([&](Operation *op) { insertOp(op); });
@@ -382,8 +396,7 @@ static Value lowerInternalPathAnno(AnnoPathValue &srcTarget,
   if (!moduleTarget.instances.empty()) {
     modInstance = moduleTarget.instances.back();
   } else {
-    auto *node = state.instancePathCache.instanceGraph.lookup(
-        cast<hw::HWModuleLike>((Operation *)mod));
+    auto *node = state.instancePathCache.instanceGraph.lookup(mod);
     if (!node->hasOneUse()) {
       mod->emitOpError(
           "cannot be used for DataTaps, it is instantiated multiple times");
@@ -562,7 +575,8 @@ LogicalResult circt::firrtl::applyGCTDataTaps(const AnnoPathValue &target,
       AnnoPathValue internalPathSrc;
       auto targetType = wireTarget->ref.getType().cast<FIRRTLBaseType>();
       if (wireTarget->fieldIdx)
-        targetType = targetType.getFinalTypeByFieldID(wireTarget->fieldIdx);
+        targetType = cast<FIRRTLBaseType>(
+            targetType.getFinalTypeByFieldID(wireTarget->fieldIdx));
       sendVal = lowerInternalPathAnno(internalPathSrc, *moduleTarget, target,
                                       internalPathAttr, targetType, state);
       if (!sendVal)
@@ -598,8 +612,7 @@ LogicalResult circt::firrtl::applyGCTDataTaps(const AnnoPathValue &target,
                                                       lastInst->getBlock());
       builder.setInsertionPointAfter(lastInst);
       // Instance port cannot be used as an annotation target, so use a NodeOp.
-      auto node = builder.create<NodeOp>(lastInst.getType(portNo),
-                                         lastInst.getResult(portNo));
+      auto node = builder.create<NodeOp>(lastInst.getResult(portNo));
       AnnotationSet::addDontTouch(node);
       srcTarget->ref = AnnoTarget(circt::firrtl::detail::AnnoTargetImpl(node));
     }
@@ -644,10 +657,13 @@ LogicalResult circt::firrtl::applyGCTDataTaps(const AnnoPathValue &target,
         valType.getWidthlessType() != wireType.getWidthlessType()) {
       // Helper: create a wire, cast it with callback, connect cast to sink.
       auto addWireWithCast = [&](auto createCast) {
-        auto wire = sinkBuilder.create<WireOp>(
-            valType,
-            state.getNamespace(wireModule).newName(tapName.getValue()));
-        sinkBuilder.create<ConnectOp>(sink, createCast(wire));
+        auto wire =
+            sinkBuilder
+                .create<WireOp>(
+                    valType,
+                    state.getNamespace(wireModule).newName(tapName.getValue()))
+                .getResult();
+        emitConnect(sinkBuilder, sink, createCast(wire));
         sink = wire;
       };
       if (isa<IntType>(wireType))

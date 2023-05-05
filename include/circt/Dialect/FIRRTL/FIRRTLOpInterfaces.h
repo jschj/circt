@@ -25,10 +25,15 @@
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+namespace mlir {
+class PatternRewriter;
+} // end namespace mlir
+
 namespace circt {
 namespace firrtl {
 
 class FIRRTLType;
+class Forceable;
 
 /// This holds the name and type that describes the module's ports.
 struct PortInfo {
@@ -63,19 +68,13 @@ struct PortInfo {
 
   /// Return true if this is an inout port.  This will be true if the port
   /// contains either bi-directional signals or analog types.
+  /// Non-HW types (e.g., ref types) are never considered InOut.
   bool isInOut() {
-    auto flags = TypeSwitch<Type, RecursiveTypeProperties>(type)
-                     .Case<FIRRTLBaseType>([](auto base) {
-                       return base.getRecursiveTypeProperties();
-                     })
-                     .Case<RefType>([](auto ref) {
-                       return ref.getType().getRecursiveTypeProperties();
-                     })
-                     .Default([](auto) {
-                       llvm_unreachable("unsupported type");
-                       return RecursiveTypeProperties{};
-                     });
-    return !flags.isPassive || flags.containsAnalog;
+    auto baseType = dyn_cast<FIRRTLBaseType>(type);
+    if (!baseType)
+      return false;
+
+    return !baseType.isPassive() || baseType.containsAnalog();
   }
 
   /// Default constructors
@@ -106,6 +105,18 @@ enum class ConnectBehaviorKind {
 
 /// Verification hook for verifying module like operations.
 LogicalResult verifyModuleLikeOpInterface(FModuleLike module);
+
+namespace detail {
+/// Return null or forceable reference result type.
+RefType getForceableResultType(bool forceable, Type type);
+/// Verify a Forceable op.
+LogicalResult verifyForceableOp(Forceable op);
+/// Replace a Forceable op with equivalent, changing whether forceable.
+/// No-op if already has specified forceability.
+Forceable
+replaceWithNewForceability(Forceable op, bool forceable,
+                           ::mlir::PatternRewriter *rewriter = nullptr);
+} // end namespace detail
 
 } // namespace firrtl
 } // namespace circt

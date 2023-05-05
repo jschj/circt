@@ -21,6 +21,7 @@
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/Comb/CombVisitors.h"
 #include "circt/Dialect/HW/HWAttributes.h"
+#include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/HW/HWVisitors.h"
 #include "circt/Dialect/SV/SVAttributes.h"
@@ -106,11 +107,11 @@ struct SubExprInfo {
 // Helper routines
 //===----------------------------------------------------------------------===//
 
-static Attribute getInt32Attr(MLIRContext *ctx, uint32_t value) {
+static TypedAttr getInt32Attr(MLIRContext *ctx, uint32_t value) {
   return Builder(ctx).getI32IntegerAttr(value);
 }
 
-static Attribute getIntAttr(MLIRContext *ctx, Type t, const APInt &value) {
+static TypedAttr getIntAttr(MLIRContext *ctx, Type t, const APInt &value) {
   return Builder(ctx).getIntegerAttr(t, value);
 }
 
@@ -152,7 +153,7 @@ static bool isDuplicatableExpression(Operation *op) {
     return isDuplicatableNullaryExpression(op);
 
   // It is cheap to inline extract op.
-  if (isa<comb::ExtractOp, hw::StructExtractOp>(op))
+  if (isa<comb::ExtractOp, hw::StructExtractOp, hw::UnionExtractOp>(op))
     return true;
 
   // We only inline array_get with a constant, port or wire index.
@@ -265,25 +266,6 @@ bool ExportVerilog::isVerilogExpression(Operation *op) {
   return isCombinational(op) || isExpression(op);
 }
 
-/// Return the width of the specified type in bits or -1 if it isn't
-/// supported.
-// NOLINTBEGIN(misc-no-recursion)
-static int getBitWidthOrSentinel(Type type) {
-  return TypeSwitch<Type, int>(type)
-      .Case<IntegerType>([](IntegerType integerType) {
-        // Verilog doesn't support zero bit integers.  We only support them in
-        // limited cases.
-        return integerType.getWidth();
-      })
-      .Case<InOutType>([](InOutType inoutType) {
-        return getBitWidthOrSentinel(inoutType.getElementType());
-      })
-      .Case<TypeAliasType>([](TypeAliasType alias) {
-        return getBitWidthOrSentinel(alias.getInnerType());
-      })
-      .Default([](Type) { return -1; });
-}
-
 /// Push this type's dimension into a vector.
 static void getTypeDims(SmallVectorImpl<Attribute> &dims, Type type,
                         Location loc) {
@@ -327,6 +309,7 @@ static bool haveMatchingDims(Type a, Type b, Location loc) {
 
 // NOLINTBEGIN(misc-no-recursion)
 bool ExportVerilog::isZeroBitType(Type type) {
+  type = getCanonicalType(type);
   if (auto intType = type.dyn_cast<IntegerType>())
     return intType.getWidth() == 0;
   if (auto inout = type.dyn_cast<hw::InOutType>())
@@ -338,6 +321,10 @@ bool ExportVerilog::isZeroBitType(Type type) {
   if (auto structType = type.dyn_cast<hw::StructType>())
     return llvm::all_of(structType.getElements(),
                         [](auto elem) { return isZeroBitType(elem.type); });
+  if (auto enumType = type.dyn_cast<hw::EnumType>())
+    return enumType.getFields().empty();
+  if (auto unionType = type.dyn_cast<hw::UnionType>())
+    return hw::getBitWidth(unionType) == 0;
 
   // We have an open type system, so assume it is ok.
   return false;
@@ -380,6 +367,8 @@ static StringRef getVerilogDeclWord(Operation *op,
     auto elementType =
         op->getResult(0).getType().cast<InOutType>().getElementType();
     if (elementType.isa<StructType>())
+      return "";
+    if (elementType.isa<UnionType>())
       return "";
     if (elementType.isa<EnumType>())
       return "";
@@ -580,7 +569,8 @@ static bool isOkToBitSelectFrom(Value v) {
     return true;
 
   // Aggregate access can be inlined.
-  if (v.getDefiningOp<StructExtractOp>() || v.getDefiningOp<ArrayGetOp>())
+  if (isa_and_nonnull<StructExtractOp, UnionExtractOp, ArrayGetOp>(
+          v.getDefiningOp()))
     return true;
 
   // Interface signal can be inlined.
@@ -611,7 +601,7 @@ static bool isExpressionUnableToInline(Operation *op,
 
   // StructCreateOp needs to be assigning to a named temporary so that types
   // are inferred properly by verilog
-  if (isa<StructCreateOp>(op))
+  if (isa<StructCreateOp, UnionCreateOp>(op))
     return true;
 
   // Aggregate literal syntax only works in an assignment expression, where
@@ -634,7 +624,8 @@ static bool isExpressionUnableToInline(Operation *op,
     //     assign bar = {{a}, {b}, {c}, {d}}[idx];
     //
     // To handle these, we push the subexpression into a temporary.
-    if (isa<ExtractOp, ArraySliceOp, ArrayGetOp, StructExtractOp>(user))
+    if (isa<ExtractOp, ArraySliceOp, ArrayGetOp, StructExtractOp,
+            UnionExtractOp, IndexedPartSelectOp>(user))
       if (op->getResult(0) == user->getOperand(0) && // ignore index operands.
           !isOkToBitSelectFrom(op->getResult(0)))
         return true;
@@ -812,9 +803,13 @@ StringRef getVerilogValueName(Value val) {
   if (auto *op = val.getDefiningOp())
     return getSymOpName(op);
 
-  if (auto port = val.dyn_cast<BlockArgument>())
+  if (auto port = val.dyn_cast<BlockArgument>()) {
+    // If the value is defined by for op, use its associated verilog name.
+    if (auto forOp = dyn_cast<ForOp>(port.getParentBlock()->getParentOp()))
+      return forOp->getAttrOfType<StringAttr>("hw.verilogName");
     return getPortVerilogName(port.getParentBlock()->getParentOp(),
                               port.getArgNumber());
+  }
   assert(false && "unhandled value");
   return {};
 }
@@ -1322,7 +1317,7 @@ static void emitDims(ArrayRef<Attribute> dims, raw_ostream &os, Location loc,
 
     // Otherwise it must be a parameterized dimension.  Shove the "-1" into the
     // attribute so it gets printed in canonical form.
-    auto typedAttr = width.dyn_cast<mlir::TypedAttr>();
+    auto typedAttr = width.dyn_cast<TypedAttr>();
     if (!typedAttr) {
       mlir::emitError(loc, "untyped dimension attribute ") << width;
       continue;
@@ -1330,7 +1325,7 @@ static void emitDims(ArrayRef<Attribute> dims, raw_ostream &os, Location loc,
     auto negOne = getIntAttr(
         loc.getContext(), typedAttr.getType(),
         APInt(typedAttr.getType().getIntOrFloatBitWidth(), -1L, true));
-    width = ParamExprAttr::get(PEO::Add, width, negOne);
+    width = ParamExprAttr::get(PEO::Add, typedAttr, negOne);
     os << '[';
     emitter.printParamValue(width, os, [loc]() {
       return mlir::emitError(loc, "invalid parameter in type");
@@ -1392,7 +1387,10 @@ static bool printPackedTypeImpl(Type type, raw_ostream &os, Location loc,
                                    emitter);
       })
       .Case<EnumType>([&](EnumType enumType) {
-        os << "enum {";
+        os << "enum ";
+        if (enumType.getBitWidth() != 32)
+          os << "bit [" << enumType.getBitWidth() - 1 << ":0] ";
+        os << "{";
         Type enumPrefixType = optionalAliasType ? optionalAliasType : enumType;
         llvm::interleaveComma(
             enumType.getFields().getAsRange<StringAttr>(), os,
@@ -1423,6 +1421,53 @@ static bool printPackedTypeImpl(Type type, raw_ostream &os, Location loc,
           os << ' ' << emitter.getVerilogStructFieldName(element.name);
           emitter.printUnpackedTypePostfix(element.type, os);
           os << "; ";
+        }
+        os << '}';
+        emitDims(dims, os, loc, emitter);
+        return true;
+      })
+      .Case<UnionType>([&](UnionType unionType) {
+        if (unionType.getElements().empty() || isZeroBitType(unionType)) {
+          os << "/*Zero Width*/";
+          return true;
+        }
+
+        int64_t unionWidth = hw::getBitWidth(unionType);
+        os << "union packed {";
+        for (auto &element : unionType.getElements()) {
+          if (isZeroBitType(element.type)) {
+            os << "/*" << emitter.getVerilogStructFieldName(element.name)
+               << ": Zero Width;*/ ";
+            continue;
+          }
+          int64_t elementWidth = hw::getBitWidth(element.type);
+          bool needsPadding = elementWidth < unionWidth || element.offset > 0;
+          if (needsPadding) {
+            os << " struct packed {";
+            if (element.offset) {
+              os << "logic [" << element.offset - 1 << ":0] "
+                 << "__pre_padding_" << element.name.getValue() << "; ";
+            }
+          }
+
+          SmallVector<Attribute, 8> structDims;
+          printPackedTypeImpl(stripUnpackedTypes(element.type), os, loc,
+                              structDims,
+                              /*implicitIntType=*/false,
+                              /*singleBitDefaultType=*/true, emitter);
+          os << ' ' << emitter.getVerilogStructFieldName(element.name);
+          emitter.printUnpackedTypePostfix(element.type, os);
+          os << ";";
+
+          if (needsPadding) {
+            if (elementWidth + (int64_t)element.offset < unionWidth) {
+              os << " logic ["
+                 << unionWidth - (elementWidth + element.offset) - 1 << ":0] "
+                 << "__post_padding_" << element.name.getValue() << ";";
+            }
+            os << "} " << emitter.getVerilogStructFieldName(element.name)
+               << ";";
+          }
         }
         os << '}';
         emitDims(dims, os, loc, emitter);
@@ -1923,6 +1968,9 @@ private:
   SubExprInfo visitTypeOp(StructCreateOp op);
   SubExprInfo visitTypeOp(StructExtractOp op);
   SubExprInfo visitTypeOp(StructInjectOp op);
+  SubExprInfo visitTypeOp(UnionCreateOp op);
+  SubExprInfo visitTypeOp(UnionExtractOp op);
+  SubExprInfo visitTypeOp(EnumCmpOp op);
   SubExprInfo visitTypeOp(EnumConstantOp op);
 
   // Comb Dialect Operations
@@ -2806,6 +2854,83 @@ SubExprInfo ExprEmitter::visitTypeOp(EnumConstantOp op) {
   return {Selection, IsUnsigned};
 }
 
+SubExprInfo ExprEmitter::visitTypeOp(EnumCmpOp op) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+  auto result = emitBinary(op, Comparison, "==", NoRequirement);
+  // SystemVerilog 11.8.1: "Comparison... operator results are unsigned,
+  // regardless of the operands".
+  result.signedness = IsUnsigned;
+  return result;
+}
+
+SubExprInfo ExprEmitter::visitTypeOp(UnionCreateOp op) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+
+  // Check if this union type has been padded.
+  auto fieldName = op.getFieldAttr();
+  auto unionType = cast<UnionType>(getCanonicalType(op.getType()));
+  auto unionWidth = hw::getBitWidth(unionType);
+  auto element = unionType.getFieldInfo(fieldName.getValue());
+  auto elementWidth = hw::getBitWidth(element.type);
+
+  // If the element is 0 width, just fill the union with 0s.
+  if (!elementWidth) {
+    ps.addAsString(unionWidth);
+    ps << "'h0";
+    return {Unary, IsUnsigned};
+  }
+
+  // If the element has no padding, emit it directly.
+  if (elementWidth == unionWidth) {
+    emitSubExpr(op.getInput(), LowestPrecedence);
+    return {Unary, IsUnsigned};
+  }
+
+  // Emit the value as a bitconcat, supplying 0 for the padding bits.
+  ps << "{";
+  ps.scopedBox(PP::ibox0, [&]() {
+    if (auto prePadding = element.offset) {
+      ps.addAsString(prePadding);
+      ps << "'h0," << PP::space;
+    }
+    emitSubExpr(op.getInput(), Selection);
+    if (auto postPadding = unionWidth - elementWidth - element.offset) {
+      ps << "," << PP::space;
+      ps.addAsString(postPadding);
+      ps << "'h0";
+    }
+    ps << "}";
+  });
+
+  return {Unary, IsUnsigned};
+}
+
+SubExprInfo ExprEmitter::visitTypeOp(UnionExtractOp op) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+  emitSubExpr(op.getInput(), Selection);
+
+  // Check if this union type has been padded.
+  auto fieldName = op.getFieldAttr();
+  auto unionType = cast<UnionType>(getCanonicalType(op.getInput().getType()));
+  auto unionWidth = hw::getBitWidth(unionType);
+  auto element = unionType.getFieldInfo(fieldName.getValue());
+  auto elementWidth = hw::getBitWidth(element.type);
+  bool needsPadding = elementWidth < unionWidth || element.offset > 0;
+  auto verilogFieldName = emitter.getVerilogStructFieldName(fieldName);
+
+  // If the element needs padding then we need to get the actual element out
+  // of an anonymous structure.
+  if (needsPadding)
+    ps << "." << PPExtString(verilogFieldName);
+
+  // Get the correct member from the union.
+  ps << "." << PPExtString(verilogFieldName);
+  return {Selection, IsUnsigned};
+}
+
 SubExprInfo ExprEmitter::visitUnhandledExpr(Operation *op) {
   emitOpError(op, "cannot emit this expression to Verilog");
   ps << "<<unsupported expr: " << PPExtString(op->getName().getStringRef())
@@ -2940,6 +3065,10 @@ private:
   LogicalResult
   emitAssignLike(Op op, PPExtString syntax,
                  std::optional<PPExtString> wordBeforeLHS = std::nullopt);
+  void emitAssignLike(llvm::function_ref<void()> emitLHS,
+                      llvm::function_ref<void()> emitRHS, PPExtString syntax,
+                      PPExtString postSyntax = PPExtString(";"),
+                      std::optional<PPExtString> wordBeforeLHS = std::nullopt);
   LogicalResult visitSV(AssignOp op);
   LogicalResult visitSV(BPAssignOp op);
   LogicalResult visitSV(PAssignOp op);
@@ -2987,6 +3116,8 @@ private:
 
   LogicalResult visitSV(GenerateOp op);
   LogicalResult visitSV(GenerateCaseOp op);
+
+  LogicalResult visitSV(ForOp op);
 
   void emitAssertionLabel(Operation *op, StringRef opName);
   void emitAssertionMessage(StringAttr message, ValueRange args,
@@ -3049,6 +3180,26 @@ void StmtEmitter::emitSVAttributes(Operation *op) {
   setPendingNewline();
 }
 
+void StmtEmitter::emitAssignLike(llvm::function_ref<void()> emitLHS,
+                                 llvm::function_ref<void()> emitRHS,
+                                 PPExtString syntax, PPExtString postSyntax,
+                                 std::optional<PPExtString> wordBeforeLHS) {
+  // If wraps, indent.
+  ps.scopedBox(PP::ibox2, [&]() {
+    if (wordBeforeLHS) {
+      ps << *wordBeforeLHS << PP::space;
+    }
+    emitLHS();
+    // Allow breaking before 'syntax' (e.g., '=') if long assignment.
+    ps << PP::space << syntax << PP::space;
+    // RHS is boxed to right of the syntax.
+    ps.scopedBox(PP::ibox0, [&]() {
+      emitRHS();
+      ps << postSyntax;
+    });
+  });
+}
+
 template <typename Op>
 LogicalResult
 StmtEmitter::emitAssignLike(Op op, PPExtString syntax,
@@ -3057,20 +3208,9 @@ StmtEmitter::emitAssignLike(Op op, PPExtString syntax,
   ops.insert(op);
 
   startStatement();
-  // If wraps, indent.
-  ps.scopedBox(PP::ibox2, [&]() {
-    if (wordBeforeLHS) {
-      ps << *wordBeforeLHS << PP::space;
-    }
-    emitExpression(op.getDest(), ops);
-    // Allow breaking before 'syntax' (e.g., '=') if long assignment.
-    ps << PP::space << syntax << PP::space;
-    // RHS is boxed to right of the syntax.
-    ps.scopedBox(PP::ibox0, [&]() {
-      emitExpression(op.getSrc(), ops);
-      ps << ";";
-    });
-  });
+  emitAssignLike([&]() { emitExpression(op.getDest(), ops); },
+                 [&]() { emitExpression(op.getSrc(), ops); }, syntax,
+                 PPExtString(";"), wordBeforeLHS);
 
   emitLocationInfoAndNewLine(ops);
   return success();
@@ -3253,6 +3393,10 @@ LogicalResult StmtEmitter::visitStmt(TypedeclOp op) {
     emitError(op, "SV attributes emission is unimplemented for the op");
 
   startStatement();
+  auto zeroBitType = isZeroBitType(op.getType());
+  if (zeroBitType)
+    ps << PP::neverbox << "// ";
+
   SmallPtrSet<Operation *, 8> ops;
   ops.insert(op);
   ps.scopedBox(PP::ibox2, [&]() {
@@ -3266,6 +3410,8 @@ LogicalResult StmtEmitter::visitStmt(TypedeclOp op) {
         [&](auto &os) { emitter.printUnpackedTypePostfix(op.getType(), os); });
     ps << ";";
   });
+  if (zeroBitType)
+    ps << PP::end;
   emitLocationInfoAndNewLine(ops);
   return success();
 }
@@ -3537,6 +3683,50 @@ LogicalResult StmtEmitter::visitSV(GenerateCaseOp op) {
   startStatement();
   ps << "endcase";
   setPendingNewline();
+  return success();
+}
+
+LogicalResult StmtEmitter::visitSV(ForOp op) {
+  emitSVAttributes(op);
+  llvm::SmallPtrSet<Operation *, 8> ops;
+  startStatement();
+  auto inductionVarName = op->getAttrOfType<StringAttr>("hw.verilogName");
+  ps << "for (";
+  // Emit statements on same line if possible, or put each on own line.
+  ps.scopedBox(PP::cbox0, [&]() {
+    // Emit initialization assignment.
+    emitAssignLike(
+        [&]() {
+          ps << "logic" << PP::nbsp;
+          ps.invokeWithStringOS([&](auto &os) {
+            emitter.emitTypeDims(op.getInductionVar().getType(), op.getLoc(),
+                                 os);
+          });
+          ps << PP::nbsp << PPExtString(inductionVarName);
+        },
+        [&]() { emitExpression(op.getLowerBound(), ops); }, PPExtString("="));
+    // Break between statements.
+    ps << PP::space;
+
+    // Emit bounds-check statement.
+    emitAssignLike([&]() { ps << PPExtString(inductionVarName); },
+                   [&]() { emitExpression(op.getUpperBound(), ops); },
+                   PPExtString("<"));
+    // Break between statements.
+    ps << PP::space;
+
+    // Emit update statement and trailing syntax.
+    emitAssignLike([&]() { ps << PPExtString(inductionVarName); },
+                   [&]() { emitExpression(op.getStep(), ops); },
+                   PPExtString("+="), PPExtString(") begin"));
+  });
+  // Don't break for because of newline.
+  ps << PP::neverbreak;
+  setPendingNewline();
+  emitStatementBlock(op.getBody().getBlocks().front());
+  startStatement();
+  ps << "end";
+  emitLocationInfoAndNewLine(ops);
   return success();
 }
 
@@ -5334,6 +5524,7 @@ struct ExportVerilogPass : public ExportVerilogBase<ExportVerilogPass> {
   void runOnOperation() override {
     // Prepare the ops in the module for emission.
     mlir::OpPassManager preparePM("builtin.module");
+    preparePM.addPass(createLegalizeAnonEnumsPass());
     auto &modulePM = preparePM.nest<hw::HWModuleOp>();
     modulePM.addPass(createPrepareForEmissionPass());
     if (failed(runPipeline(preparePM, getOperation())))

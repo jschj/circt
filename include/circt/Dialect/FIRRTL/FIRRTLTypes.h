@@ -22,8 +22,11 @@
 namespace circt {
 namespace firrtl {
 namespace detail {
+struct FIRRTLBaseTypeStorage;
+struct WidthTypeStorage;
 struct BundleTypeStorage;
 struct VectorTypeStorage;
+struct FEnumTypeStorage;
 struct CMemoryTypeStorage;
 struct RefTypeStorage;
 } // namespace detail.
@@ -36,23 +39,23 @@ class UIntType;
 class AnalogType;
 class BundleType;
 class FVectorType;
+class FEnumType;
 class RefType;
 
 /// A collection of bits indicating the recursive properties of a type.
 struct RecursiveTypeProperties {
   /// Whether the type only contains passive elements.
   bool isPassive : 1;
+  /// Whether the type contains a reference type.
+  bool containsReference : 1;
   /// Whether the type contains an analog type.
   bool containsAnalog : 1;
+  /// Whether the type contains a const type.
+  bool containsConst : 1;
   /// Whether the type has any uninferred bit widths.
   bool hasUninferredWidth : 1;
-
-  /// The number of bits required to represent a type's recursive properties.
-  static constexpr unsigned numBits = 3;
-  /// Unpack `RecursiveTypeProperties` from a bunch of bits.
-  static RecursiveTypeProperties fromFlags(unsigned bits);
-  /// Pack `RecursiveTypeProperties` as a bunch of bits.
-  unsigned toFlags() const;
+  /// Whether the type has any uninferred reset.
+  bool hasUninferredReset : 1;
 };
 
 // This is a common base class for all FIRRTL types.
@@ -63,37 +66,70 @@ public:
     return llvm::isa<FIRRTLDialect>(type.getDialect());
   }
 
-protected:
-  using Type::Type;
-};
+  /// Return the recursive properties of the type, containing the `isPassive`,
+  /// `containsAnalog`, and `hasUninferredWidth` bits, among others.
+  RecursiveTypeProperties getRecursiveTypeProperties() const;
 
-// Common base class for all base FIRRTL types.
-class FIRRTLBaseType : public FIRRTLType {
-public:
-  /// Return true if this is a "passive" type - one that contains no "flip"
-  /// types recursively within itself.
-  bool isPassive() { return getRecursiveTypeProperties().isPassive; }
+  //===--------------------------------------------------------------------===//
+  // Convenience methods for accessing recursive type properties
+  //===--------------------------------------------------------------------===//
 
-  /// Returns true if this is a "passive" that which is not analog.
-  bool isRegisterType() { return isPassive() && !containsAnalog(); }
-
-  /// Return true if this is a 'ground' type, aka a non-aggregate type.
-  bool isGround();
+  /// Returns true if this is or contains a 'const' type.
+  bool containsConst() { return getRecursiveTypeProperties().containsConst; }
 
   /// Return true if this is or contains an Analog type.
   bool containsAnalog() { return getRecursiveTypeProperties().containsAnalog; }
+
+  /// Return true if this is or contains a Reference type.
+  bool containsReference() {
+    return getRecursiveTypeProperties().containsReference;
+  }
 
   /// Return true if this type contains an uninferred bit width.
   bool hasUninferredWidth() {
     return getRecursiveTypeProperties().hasUninferredWidth;
   }
 
-  /// Return the recursive properties of the type, containing the `isPassive`,
-  /// `containsAnalog`, and `hasUninferredWidth` bits.
-  RecursiveTypeProperties getRecursiveTypeProperties();
+  /// Return true if this type contains an uninferred bit reset.
+  bool hasUninferredReset() {
+    return getRecursiveTypeProperties().hasUninferredReset;
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Type classifications
+  //===--------------------------------------------------------------------===//
+
+  /// Return true if this is a 'ground' type, aka a non-aggregate type.
+  bool isGround();
+
+  /// Returns true if this is a 'const' type that can only hold compile-time
+  /// constant values
+  bool isConst();
+
+protected:
+  using Type::Type;
+};
+
+// Common base class for all base FIRRTL types.
+class FIRRTLBaseType
+    : public FIRRTLType::TypeBase<FIRRTLBaseType, FIRRTLType,
+                                  detail::FIRRTLBaseTypeStorage> {
+public:
+  using Base::Base;
+
+  /// Returns true if this is a 'const' type that can only hold compile-time
+  /// constant values
+  bool isConst();
+
+  /// Return true if this is a "passive" type - one that contains no "flip"
+  /// types recursively within itself.
+  bool isPassive() const { return getRecursiveTypeProperties().isPassive; }
 
   /// Return this type with any flip types recursively removed from itself.
   FIRRTLBaseType getPassiveType();
+
+  /// Return a 'const' or non-'const' version of this type.
+  FIRRTLBaseType getConstType(bool isConst);
 
   /// Return this type with all ground types replaced with UInt<1>.  This is
   /// used for `mem` operations.
@@ -115,8 +151,17 @@ public:
     return llvm::isa<FIRRTLDialect>(type.getDialect()) && !type.isa<RefType>();
   }
 
+  /// Returns true if this is a non-const "passive" that which is not analog.
+  bool isRegisterType() {
+    return isPassive() && !containsAnalog() && !containsConst();
+  }
+
   /// Return true if this is a valid "reset" type.
   bool isResetType();
+
+  //===--------------------------------------------------------------------===//
+  // hw::FieldIDTypeInterface
+  //===--------------------------------------------------------------------===//
 
   /// Get the maximum field ID of this type.  For integers and other ground
   /// types, there are no subfields and the maximum field ID is 0.  For bundle
@@ -128,39 +173,34 @@ public:
   /// Get the sub-type of a type for a field ID, and the subfield's ID. Strip
   /// off a single layer of this type and return the sub-type and a field ID
   /// targeting the same field, but rebased on the sub-type.
-  std::pair<FIRRTLBaseType, uint64_t> getSubTypeByFieldID(uint64_t fieldID);
+  std::pair<circt::hw::FieldIDTypeInterface, uint64_t>
+  getSubTypeByFieldID(uint64_t fieldID);
 
   /// Return the final type targeted by this field ID by recursively walking all
   /// nested aggregate types. This is the identity function for ground types.
-  FIRRTLBaseType getFinalTypeByFieldID(uint64_t fieldID);
+  circt::hw::FieldIDTypeInterface getFinalTypeByFieldID(uint64_t fieldID);
 
   /// Returns the effective field id when treating the index field as the
   /// root of the type.  Essentially maps a fieldID to a fieldID after a
   /// subfield op. Returns the new id and whether the id is in the given
   /// child.
   std::pair<uint64_t, bool> rootChildFieldID(uint64_t fieldID, uint64_t index);
-
-  /// Get the number of ground (non-aggregate) fields in the type.  A field
-  /// which is a bundle or vector is not counted, but the recursive ground
-  /// fields of are.
-  uint64_t getGroundFields() const;
-
-protected:
-  using FIRRTLType::FIRRTLType;
 };
 
 /// Returns whether the two types are equivalent.  This implements the exact
 /// definition of type equivalence in the FIRRTL spec.  If the types being
 /// compared have any outer flips that encode FIRRTL module directions (input or
 /// output), these should be stripped before using this method.
-bool areTypesEquivalent(FIRRTLType destType, FIRRTLType srcType);
+bool areTypesEquivalent(FIRRTLType destType, FIRRTLType srcType,
+                        bool srcOuterTypeIsConst = false);
 
 /// Returns true if two types are weakly equivalent.  See the FIRRTL spec,
 /// Section 4.6, for a full definition of this.  Roughly, the oriented types
 /// (the types with any flips pushed to the leaves) must match.  This allows for
 /// types with flips in different positions to be equivalent.
 bool areTypesWeaklyEquivalent(FIRRTLType destType, FIRRTLType srcType,
-                              bool destFlip = false, bool srcFlip = false);
+                              bool destFlip = false, bool srcFlip = false,
+                              bool srcOuterTypeIsConst = false);
 
 /// Returns true if the destination is at least as wide as a source.  The source
 /// and destination types must be equivalent non-analog types.  The types are
@@ -171,7 +211,6 @@ bool areTypesWeaklyEquivalent(FIRRTLType destType, FIRRTLType srcType,
 /// hold their counterparts.
 bool isTypeLarger(FIRRTLBaseType dstType, FIRRTLBaseType srcType);
 
-mlir::Type getVectorElementType(mlir::Type array);
 mlir::Type getPassiveType(mlir::Type anyBaseFIRRTLType);
 
 //===----------------------------------------------------------------------===//
@@ -215,15 +254,19 @@ class IntType : public FIRRTLBaseType, public WidthQualifiedTypeTrait<IntType> {
 public:
   using FIRRTLBaseType::FIRRTLBaseType;
 
-  /// Return an SIntType or UIntType with the specified signedness and width.
+  /// Return an SIntType or UIntType with the specified signedness, width, and
+  /// constness.
   static IntType get(MLIRContext *context, bool isSigned,
-                     int32_t widthOrSentinel = -1);
+                     int32_t widthOrSentinel = -1, bool isConst = false);
 
   bool isSigned() { return isa<SIntType>(); }
   bool isUnsigned() { return isa<UIntType>(); }
 
   /// Return the width of this type, or -1 if it has none specified.
   int32_t getWidthOrSentinel();
+
+  /// Return a 'const' or non-'const' version of this type.
+  IntType getConstType(bool isConst);
 
   static bool classof(Type type) {
     return type.isa<SIntType>() || type.isa<UIntType>();
@@ -276,25 +319,6 @@ struct DenseMapInfo<circt::firrtl::FIRRTLType> {
   }
   static unsigned getHashValue(FIRRTLType val) { return mlir::hash_value(val); }
   static bool isEqual(FIRRTLType LHS, FIRRTLType RHS) { return LHS == RHS; }
-};
-
-template <>
-struct DenseMapInfo<circt::firrtl::FIRRTLBaseType> {
-  using FIRRTLBaseType = circt::firrtl::FIRRTLBaseType;
-  static FIRRTLBaseType getEmptyKey() {
-    auto pointer = llvm::DenseMapInfo<void *>::getEmptyKey();
-    return FIRRTLBaseType(static_cast<mlir::Type::ImplType *>(pointer));
-  }
-  static FIRRTLBaseType getTombstoneKey() {
-    auto pointer = llvm::DenseMapInfo<void *>::getTombstoneKey();
-    return FIRRTLBaseType(static_cast<mlir::Type::ImplType *>(pointer));
-  }
-  static unsigned getHashValue(FIRRTLBaseType val) {
-    return mlir::hash_value(val);
-  }
-  static bool isEqual(FIRRTLBaseType LHS, FIRRTLBaseType RHS) {
-    return LHS == RHS;
-  }
 };
 
 } // namespace llvm

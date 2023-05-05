@@ -26,6 +26,7 @@
 #include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/HWAttributes.h"
+#include "circt/Dialect/SV/SVAttributes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/PostOrderIterator.h"
@@ -113,7 +114,7 @@ static FlatSymbolRefAttr buildNLA(const AnnoPathValue &target,
   }
 
   insts.push_back(
-      FlatSymbolRefAttr::get(target.ref.getModule().moduleNameAttr()));
+      FlatSymbolRefAttr::get(target.ref.getModule().getModuleNameAttr()));
 
   auto instAttr = ArrayAttr::get(state.circuit.getContext(), insts);
 
@@ -304,6 +305,85 @@ static LogicalResult applyDUTAnno(const AnnoPathValue &target,
   return success();
 }
 
+// Like symbolizeConvention, but disallows the internal convention.
+static std::optional<Convention> parseConvention(llvm::StringRef str) {
+  return ::llvm::StringSwitch<::std::optional<Convention>>(str)
+      .Case("scalarized", Convention::Scalarized)
+      .Default(std::nullopt);
+}
+
+static LogicalResult applyConventionAnno(const AnnoPathValue &target,
+                                         DictionaryAttr anno,
+                                         ApplyState &state) {
+  auto *op = target.ref.getOp();
+  auto loc = op->getLoc();
+  auto error = [&]() {
+    auto diag = mlir::emitError(loc);
+    diag << "circuit.ConventionAnnotation ";
+    return diag;
+  };
+
+  auto opTarget = target.ref.dyn_cast<OpAnnoTarget>();
+  if (!opTarget)
+    return error() << "must target a module object";
+
+  if (!target.isLocal())
+    return error() << "must be local";
+
+  auto conventionStrAttr =
+      tryGetAs<StringAttr>(anno, anno, "convention", loc, conventionAnnoClass);
+  if (!conventionStrAttr)
+    return failure();
+
+  auto conventionStr = conventionStrAttr.getValue();
+  auto conventionOpt = parseConvention(conventionStr);
+  if (!conventionOpt)
+    return error() << "unknown convention " << conventionStr;
+
+  auto convention = *conventionOpt;
+
+  if (auto moduleOp = dyn_cast<FModuleOp>(op)) {
+    moduleOp.setConvention(convention);
+    return success();
+  }
+
+  if (auto extModuleOp = dyn_cast<FExtModuleOp>(op)) {
+    extModuleOp.setConvention(convention);
+    return success();
+  }
+
+  return error() << "can only target to a module or extmodule";
+}
+
+static LogicalResult applyAttributeAnnotation(const AnnoPathValue &target,
+                                              DictionaryAttr anno,
+                                              ApplyState &state) {
+  auto *op = target.ref.getOp();
+
+  auto error = [&]() {
+    auto diag = mlir::emitError(op->getLoc());
+    diag << anno.getAs<StringAttr>("class").getValue() << " ";
+    return diag;
+  };
+
+  if (!target.ref.isa<OpAnnoTarget>())
+    return error()
+           << "must target an operation. Currently ports are not supported";
+
+  if (!target.isLocal())
+    return error() << "must be local";
+
+  if (!isa<FModuleOp, WireOp, NodeOp, RegOp, RegResetOp>(op))
+    return error()
+           << "unhandled operation. The target must be a module, wire, node or "
+              "register";
+
+  auto name = anno.getAs<StringAttr>("description");
+  auto svAttr = sv::SVAttributeAttr::get(name.getContext(), name);
+  sv::addSVAttributes(op, {svAttr});
+  return success();
+}
+
 /// Update a memory op with attributes about memory file loading.
 template <bool isInline>
 static LogicalResult applyLoadMemoryAnno(const AnnoPathValue &target,
@@ -347,11 +427,8 @@ static LogicalResult applyLoadMemoryAnno(const AnnoPathValue &target,
     return failure();
   }
 
-  op->setAttr("init",
-              MemoryInitAttr::get(
-                  op->getContext(), filename,
-                  BoolAttr::get(op->getContext(), hexOrBinaryValue == "b"),
-                  BoolAttr::get(op->getContext(), isInline)));
+  op->setAttr("init", MemoryInitAttr::get(op->getContext(), filename,
+                                          hexOrBinaryValue == "b", isInline));
 
   return success();
 }
@@ -420,6 +497,7 @@ static const llvm::StringMap<AnnoRecord> annotationRecords{{
     {omirTrackerAnnoClass, {stdResolve, applyWithoutTarget<true>}},
     {omirFileAnnoClass, NoTargetAnnotation},
     // Miscellaneous Annotations
+    {conventionAnnoClass, {stdResolve, applyConventionAnno}},
     {dontTouchAnnoClass,
      {stdResolve, applyWithoutTarget<true, true, WireOp, NodeOp, RegOp,
                                      RegResetOp, InstanceOp, MemOp, CombMemOp,
@@ -486,8 +564,7 @@ static const llvm::StringMap<AnnoRecord> annotationRecords{{
      {stdResolve, applyLoadMemoryAnno<true>}},
     {wiringSinkAnnoClass, {stdResolve, applyWiring}},
     {wiringSourceAnnoClass, {stdResolve, applyWiring}},
-
-}};
+    {attributeAnnoClass, {stdResolve, applyAttributeAnnotation}}}};
 
 /// Lookup a record for a given annotation class.  Optionally, returns the
 /// record for "circuit.missing" if the record doesn't exist.
@@ -677,7 +754,7 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
     // If the sink is a wire with no users, then convert this to a node.
     auto destOp = dyn_cast_or_null<WireOp>(dest.getDefiningOp());
     if (destOp && dest.getUses().empty()) {
-      builder.create<NodeOp>(src.getType(), src, destOp.getName())
+      builder.create<NodeOp>(src, destOp.getName())
           .setAnnotationsAttr(destOp.getAnnotations());
       opsToErase.push_back(destOp);
       return success();
@@ -730,10 +807,10 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
     LLVM_DEBUG({
       llvm::dbgs() << "  - index: " << index << "\n"
                    << "    source:\n"
-                   << "      module: " << sourceModule.moduleName() << "\n"
+                   << "      module: " << sourceModule.getModuleName() << "\n"
                    << "      value: " << source << "\n"
                    << "    sink:\n"
-                   << "      module: " << sinkModule.moduleName() << "\n"
+                   << "      module: " << sinkModule.getModuleName() << "\n"
                    << "      value: " << sink << "\n"
                    << "    newNameHint: " << problem.newNameHint << "\n";
     });
@@ -751,17 +828,15 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
     // connecting.
     if (sourceModule == sinkModule) {
       LLVM_DEBUG(llvm::dbgs()
-                 << "    LCA: " << sourceModule.moduleName() << "\n");
+                 << "    LCA: " << sourceModule.getModuleName() << "\n");
       moduleModifications[sourceModule].connectionMap[index] = source;
       moduleModifications[sourceModule].uturns.push_back({index, sink});
       continue;
     }
 
     // Otherwise, get instance paths for source/sink, and compute LCA.
-    auto sourcePaths = state.instancePathCache.getAbsolutePaths(
-        cast<hw::HWModuleLike>(*sourceModule));
-    auto sinkPaths = state.instancePathCache.getAbsolutePaths(
-        cast<hw::HWModuleLike>(*sinkModule));
+    auto sourcePaths = state.instancePathCache.getAbsolutePaths(sourceModule);
+    auto sinkPaths = state.instancePathCache.getAbsolutePaths(sinkModule);
 
     if (sourcePaths.size() != 1 || sinkPaths.size() != 1) {
       auto diag =
@@ -786,15 +861,15 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
     }
 
     LLVM_DEBUG({
-      llvm::dbgs() << "    LCA: " << lca.moduleName() << "\n"
+      llvm::dbgs() << "    LCA: " << lca.getModuleName() << "\n"
                    << "    sourcePaths:\n";
       for (auto inst : sourcePaths[0])
-        llvm::dbgs() << "      - " << inst.instanceName() << " of "
-                     << inst.referencedModuleName() << "\n";
+        llvm::dbgs() << "      - " << inst.getInstanceName() << " of "
+                     << inst.getReferencedModuleName() << "\n";
       llvm::dbgs() << "    sinkPaths:\n";
       for (auto inst : sinkPaths[0])
-        llvm::dbgs() << "      - " << inst.instanceName() << " of "
-                     << inst.referencedModuleName() << "\n";
+        llvm::dbgs() << "      - " << inst.getInstanceName() << " of "
+                     << inst.getReferencedModuleName() << "\n";
     });
 
     // Pre-populate the connectionMap of the module with the source and sink.
@@ -872,7 +947,7 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
         }
         moduleModifications[mod].portsToAdd.push_back(
             {index, {StringAttr::get(context, name), tpe, dir}});
-        instName = inst.instanceName();
+        instName = inst.getInstanceName();
       }
     };
 
@@ -892,7 +967,7 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
 
     auto modifications = moduleModifications[fmodule];
     LLVM_DEBUG({
-      llvm::dbgs() << "  - module: " << fmodule.moduleName() << "\n";
+      llvm::dbgs() << "  - module: " << fmodule.getModuleName() << "\n";
       llvm::dbgs() << "    ports:\n";
       for (auto [index, port] : modifications.portsToAdd) {
         llvm::dbgs() << "      - name: " << port.getName() << "\n"

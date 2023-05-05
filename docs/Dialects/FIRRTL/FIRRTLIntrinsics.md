@@ -19,6 +19,10 @@ Annotations here are written in their JSON format. A "reference target"
 indicates that the annotation could target any object in the hierarchy,
 although there may be further restrictions in the annotation.
 
+We also accept the `intmodule` version of any of these annotation strings used
+as the intrinsic name.  To work with the requirement of the intrinsic name being
+an identifier, replace any period is with an underscore in the intrinsic name.
+
 ### circt.sizeof
 
 Returns the size of a type.  The input port is not read from and may be any 
@@ -63,7 +67,6 @@ type of the result.
 | found      | output    | UInt<1>  | found in args                       |
 | result     | output    | AnyType  | found in args                       |
 
-
 ### circt.plusargs.test
 
 Tests simulator command line options with SystemVerilog `$test$plusargs`.  This
@@ -76,3 +79,18 @@ is described in SystemVerilog 2012 section 21.6.
 | Port       | Direction | Type     | Description                         |
 | ---------- | --------- | -------- | ----------------------------------- |
 | found      | output    | UInt<1>  | found in args                       |
+
+### circt.clock_gate
+
+Enables and disables a clock safely, without glitches, based on a boolean enable value. If the enable input is 1, the output clock produced by the clock gate is identical to the input clock. If the enable input is 0, the output clock is a constant zero.
+
+The enable input is sampled at the rising edge of the input clock; any changes on the enable before or after that edge are ignored and do not affect the output clock.
+
+| Parameter | Type | Description |
+| --------- | ---- | ----------- |
+
+| Port | Direction | Type     | Description                 |
+| ---- | --------- | -------- | --------------------------- |
+| in   | input     | Clock    | input clock                 |
+| en   | input     | UInt<1>  | enable for the output clock |
+| out  | output    | Clock    | gated output clock          |

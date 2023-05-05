@@ -1040,6 +1040,11 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
             .Default([&](Operation *op) -> std::optional<Value> {
               auto module = cast<FModuleOp>(sourceRef.getModule());
               builder.setInsertionPointToEnd(module.getBodyBlock());
+              auto is = dyn_cast<hw::InnerSymbolOpInterface>(op);
+              // Resolve InnerSymbol references to their target result.
+              if (is && is.getTargetResult())
+                return getValueByFieldID(builder, is.getTargetResult(),
+                                         xmrSrcTarget->fieldIdx);
               if (sourceRef.getOp()->getNumResults() != 1) {
                 op->emitOpError()
                     << "cannot be used as a target of the Grand Central View \""
@@ -1075,7 +1080,8 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
 
     // Append this new Wiring Problem to the ApplyState.  The Wiring Problem
     // will be resolved to bore RefType ports before LowerAnnotations finishes.
-    state.wiringProblems.push_back({*source, sink, (path + "__bore").str(),
+    state.wiringProblems.push_back({*source, sink.getResult(),
+                                    (path + "__bore").str(),
                                     WiringProblem::RefTypeUsage::Prefer});
 
     return DictionaryAttr::getWithSorted(context, elementIface);
@@ -1406,9 +1412,10 @@ std::optional<TypeSum> GrandCentralPass::computeField(
             FieldRef fieldRef = leafMap.lookup(ground.getID()).field;
             auto value = fieldRef.getValue();
             auto fieldID = fieldRef.getFieldID();
-            auto tpe =
-                value.getType().cast<FIRRTLBaseType>().getFinalTypeByFieldID(
-                    fieldID);
+            auto tpe = cast<FIRRTLBaseType>(
+                value.getType()
+                    .cast<circt::hw::FieldIDTypeInterface>()
+                    .getFinalTypeByFieldID(fieldID));
             if (!tpe.isGround()) {
               value.getDefiningOp()->emitOpError()
                   << "cannot be added to interface with id '"
@@ -1656,7 +1663,7 @@ void GrandCentralPass::runOnOperation() {
       llvm::dbgs() << "  <none>\n";
     llvm::dbgs() << "DUT: ";
     if (dut)
-      llvm::dbgs() << dut.moduleName() << "\n";
+      llvm::dbgs() << dut.getModuleName() << "\n";
     else
       llvm::dbgs() << "<none>\n";
     llvm::dbgs()
@@ -1897,8 +1904,7 @@ void GrandCentralPass::runOnOperation() {
 
               // If the companion is instantiated above the DUT, then don't
               // extract it.
-              if (dut && !instancePaths->instanceGraph.isAncestor(
-                             op, cast<hw::HWModuleLike>(*dut))) {
+              if (dut && !instancePaths->instanceGraph.isAncestor(op, dut)) {
                 ++numAnnosRemoved;
                 return true;
               }
@@ -1921,10 +1927,11 @@ void GrandCentralPass::runOnOperation() {
                   instancePaths->instanceGraph.lookup(op);
 
               LLVM_DEBUG({
-                llvm::dbgs() << "Found companion module: "
-                             << companionNode->getModule().moduleName() << "\n"
-                             << "  submodules exclusively instantiated "
-                                "(including companion):\n";
+                llvm::dbgs()
+                    << "Found companion module: "
+                    << companionNode->getModule().getModuleName() << "\n"
+                    << "  submodules exclusively instantiated "
+                       "(including companion):\n";
               });
 
               for (auto &node : llvm::depth_first(companionNode)) {
@@ -1941,8 +1948,8 @@ void GrandCentralPass::runOnOperation() {
                   continue;
 
                 LLVM_DEBUG({
-                  llvm::dbgs() << "    - module: "
-                               << cast<FModuleLike>(*mod).moduleName() << "\n";
+                  llvm::dbgs()
+                      << "    - module: " << mod.getModuleName() << "\n";
                 });
 
                 if (auto extmodule = dyn_cast<FExtModuleOp>(*mod)) {
@@ -2154,8 +2161,7 @@ void GrandCentralPass::runOnOperation() {
       ++numInterfaces;
       if (dut &&
           !instancePaths->instanceGraph.isAncestor(
-              companionIDMap[ifaceBuilder.id].companion,
-              cast<hw::HWModuleLike>(*dut)) &&
+              companionIDMap[ifaceBuilder.id].companion, dut) &&
           testbenchDir)
         iface->setAttr("output_file",
                        hw::OutputFileAttr::getAsDirectory(
@@ -2236,8 +2242,7 @@ void GrandCentralPass::runOnOperation() {
     // If the interface is associated with a companion that is instantiated
     // above the DUT (e.g.., in the test harness), then don't extract it.
     if (dut && !instancePaths->instanceGraph.isAncestor(
-                   companionIDMap[bundle.getID()].companion,
-                   cast<hw::HWModuleLike>(*dut)))
+                   companionIDMap[bundle.getID()].companion, dut))
       continue;
   }
 
