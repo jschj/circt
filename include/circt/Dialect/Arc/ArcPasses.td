@@ -17,7 +17,9 @@ def AddTaps : Pass<"arc-add-taps", "mlir::ModuleOp"> {
   let dependentDialects = ["arc::ArcDialect"];
   let options = [
     Option<"tapPorts", "ports", "bool", "true", "Make module ports observable">,
-    Option<"tapWires", "wires", "bool", "true", "Make wires observable">
+    Option<"tapWires", "wires", "bool", "true", "Make wires observable">,
+    Option<"tapNamedValues", "named-values", "bool", "false",
+           "Make values with `sv.namehint` observable">
   ];
 }
 
@@ -25,6 +27,18 @@ def AllocateState : Pass<"arc-allocate-state", "arc::ModelOp"> {
   let summary = "Allocate and layout the global simulation state";
   let constructor = "circt::arc::createAllocateStatePass()";
   let dependentDialects = ["arc::ArcDialect"];
+}
+
+def ArcCanonicalizer : Pass<"arc-canonicalizer", "mlir::ModuleOp"> {
+  let summary = "Simulation centric canonicalizations";
+  let constructor = "createArcCanonicalizerPass()";
+  let dependentDialects = ["hw::HWDialect",
+                           "comb::CombDialect",
+                           "arc::ArcDialect"];
+  let statistics = [
+    Statistic<"numArcArgsRemoved", "num-arc-args-removed",
+      "Number of arguments removed from DefineOps">,
+  ];
 }
 
 def Dedup : Pass<"arc-dedup", "mlir::ModuleOp"> {
@@ -35,6 +49,13 @@ def Dedup : Pass<"arc-dedup", "mlir::ModuleOp"> {
   }];
   let constructor = "circt::arc::createDedupPass()";
   let dependentDialects = ["arc::ArcDialect"];
+}
+
+def GroupResetsAndEnables : Pass<"arc-group-resets-and-enables",
+                                 "mlir::ModuleOp"> {
+  let summary = "Group reset and enable conditions of lowered states";
+  let constructor = "circt::arc::createGroupResetsAndEnablesPass()";
+  let dependentDialects = ["arc::ArcDialect", "mlir::scf::SCFDialect"];
 }
 
 def InferMemories : Pass<"arc-infer-memories", "mlir::ModuleOp"> {
@@ -54,6 +75,12 @@ def InlineArcs : Pass<"arc-inline" , "mlir::ModuleOp"> {
       "Arcs removed after full inlining">,
     Statistic<"numTrivialArcs", "trivial-arcs", "Arcs with very few ops">,
     Statistic<"numSingleUseArcs", "single-use-arcs", "Arcs with a single use">,
+  ];
+  let options = [
+    Option<"intoArcsOnly", "into-arcs-only", "bool", "false",
+           "Call operations to inline">,
+    Option<"maxNonTrivialOpsInBody", "max-body-ops", "unsigned", "3",
+           "Max number of non-trivial ops in the region to be inlined">,
   ];
 }
 
@@ -78,6 +105,25 @@ def InferStateProperties : Pass<"arc-infer-state-properties",
   let dependentDialects = ["circt::hw::HWDialect", "circt::comb::CombDialect"];
 }
 
+def IsolateClocks : Pass<"arc-isolate-clocks", "mlir::ModuleOp"> {
+  let summary = "Group clocked operations into clock domains";
+  let constructor = "circt::arc::createIsolateClocksPass()";
+  let dependentDialects = ["arc::ArcDialect"];
+}
+
+def LatencyRetiming : Pass<"arc-latency-retiming", "mlir::ModuleOp"> {
+  let summary = "Push latencies through the design";
+  let constructor = "circt::arc::createLatencyRetimingPass()";
+  let dependentDialects = ["arc::ArcDialect"];
+
+  let statistics = [
+    Statistic<"numOpsRemoved", "num-ops-removed",
+      "Number of zero-latency passthrough states removed">,
+    Statistic<"latencyUnitsSaved", "latency-units-saved",
+      "Number of latency units saved by merging them in a successor state">
+  ];
+}
+
 def LegalizeStateUpdate : Pass<"arc-legalize-state-update", "mlir::ModuleOp"> {
   let summary = "Insert temporaries such that state reads don't see writes";
   let constructor = "circt::arc::createLegalizeStateUpdatePass()";
@@ -99,7 +145,10 @@ def LowerLUT : Pass<"arc-lower-lut", "arc::DefineOp"> {
 def LowerState : Pass<"arc-lower-state", "mlir::ModuleOp"> {
   let summary = "Split state into read and write ops grouped by clock tree";
   let constructor = "circt::arc::createLowerStatePass()";
-  let dependentDialects = ["arc::ArcDialect", "mlir::scf::SCFDialect"];
+  let dependentDialects = [
+    "arc::ArcDialect", "mlir::scf::SCFDialect", "mlir::func::FuncDialect",
+    "mlir::LLVM::LLVMDialect"
+  ];
 }
 
 def MakeTables : Pass<"arc-make-tables", "mlir::ModuleOp"> {
@@ -123,24 +172,6 @@ def PrintStateInfo : Pass<"arc-print-state-info", "mlir::ModuleOp"> {
   ];
 }
 
-def RemoveUnusedArcArguments : Pass<"arc-remove-unused-arc-arguments",
-    "mlir::ModuleOp"> {
-  let summary =
-    "Remove unused arc args from the arc itself and the referencing states";
-  let constructor = "circt::arc::createRemoveUnusedArcArgumentsPass()";
-
-  let statistics = [
-    Statistic<"numArcArgsRemoved", "num-arc-args-removed",
-      "Number of arguments removed from DefineOps">,
-    Statistic<"numArcsTouched", "num-arcs-touched",
-      "Number of arcs that got modified, if an arc had to be modified multiple "
-      "times, it is counted multiple times">,
-    Statistic<"numArcArgsMissed", "num-arc-args-missed",
-      "Number of arguments that could not be removed from DefineOps because "
-      "at least one user did not implement support for argument removal">,
-  ];
-}
-
 def SimplifyVariadicOps : Pass<"arc-simplify-variadic-ops", "mlir::ModuleOp"> {
   let summary = "Convert variadic ops into distributed binary ops";
   let constructor = "circt::arc::createSimplifyVariadicOpsPass()";
@@ -154,12 +185,6 @@ def SimplifyVariadicOps : Pass<"arc-simplify-variadic-ops", "mlir::ModuleOp"> {
     Statistic<"numOpsReordered", "reordered",
       "Ops where simplification reordered operands">,
   ];
-}
-
-def SinkInputs : Pass<"arc-sink-inputs", "mlir::ModuleOp"> {
-  let summary = "Sink constant inputs into arcs";
-  let constructor = "circt::arc::createSinkInputsPass()";
-  let dependentDialects = ["arc::ArcDialect"];
 }
 
 def SplitLoops : Pass<"arc-split-loops", "mlir::ModuleOp"> {

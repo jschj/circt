@@ -9,6 +9,7 @@
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Support/LogicalResult.h"
 
 using namespace circt;
 using namespace arc;
@@ -73,39 +74,6 @@ LogicalResult StateOp::canonicalize(StateOp op, PatternRewriter &rewriter) {
 }
 
 //===----------------------------------------------------------------------===//
-// MemoryReadPortOp
-//===----------------------------------------------------------------------===//
-
-OpFoldResult MemoryReadPortOp::fold(FoldAdaptor adaptor) {
-  // The result is undefined in this case, but we just return 0.
-  if (isAlways(adaptor.getEnable(), false))
-    return IntegerAttr::get(getType(), 0);
-
-  if (isAlways(adaptor.getEnable(), true))
-    return this->getEnableMutable().clear(), this->getResult();
-
-  return {};
-}
-
-//===----------------------------------------------------------------------===//
-// MemoryWritePortOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult MemoryWritePortOp::fold(FoldAdaptor adaptor,
-                                      SmallVectorImpl<OpFoldResult> &results) {
-  if (isAlways(adaptor.getEnable(), true))
-    return getEnableMutable().clear(), success();
-  return failure();
-}
-
-LogicalResult MemoryWritePortOp::canonicalize(MemoryWritePortOp op,
-                                              PatternRewriter &rewriter) {
-  if (isAlways(op.getEnable(), false))
-    return rewriter.eraseOp(op), success();
-  return failure();
-}
-
-//===----------------------------------------------------------------------===//
 // MemoryWriteOp
 //===----------------------------------------------------------------------===//
 
@@ -120,6 +88,20 @@ LogicalResult MemoryWriteOp::canonicalize(MemoryWriteOp op,
                                           PatternRewriter &rewriter) {
   if (isAlways(op.getEnable(), false))
     return rewriter.eraseOp(op), success();
+  return failure();
+}
+
+//===----------------------------------------------------------------------===//
+// StorageGetOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult StorageGetOp::canonicalize(StorageGetOp op,
+                                         PatternRewriter &rewriter) {
+  if (auto pred = op.getStorage().getDefiningOp<StorageGetOp>()) {
+    op.getStorageMutable().assign(pred.getStorage());
+    op.setOffset(op.getOffset() + pred.getOffset());
+    return success();
+  }
   return failure();
 }
 
@@ -197,19 +179,15 @@ LogicalResult ClockDomainOp::canonicalize(ClockDomainOp op,
     // constants into the clock domain.
     if (auto *inputOp = inputVal.getDefiningOp()) {
       bool isConstant = inputOp->hasTrait<OpTrait::ConstantLike>();
-      bool onlyUsedInThisClockDomain = llvm::all_of(
-          inputOp->getUsers(), [&](auto user) { return op->isAncestor(user); });
-      if ((isConstant || isa<MemoryOp>(inputOp)) && onlyUsedInThisClockDomain) {
-        inputOp->remove();
-        rewriter.insert(inputOp);
-        rewriter.replaceAllUsesWith(arg, inputVal);
-        continue;
-      }
-      // Constant operations are also allowed to be duplicated.
-      if (isConstant) {
+      bool hasOneUse = inputVal.hasOneUse();
+      if (isConstant || (isa<MemoryOp>(inputOp) && hasOneUse)) {
         auto resultNumber = cast<OpResult>(inputVal).getResultNumber();
         auto *clone = rewriter.clone(*inputOp);
         rewriter.replaceAllUsesWith(arg, clone->getResult(resultNumber));
+        if (hasOneUse && inputOp->getNumResults() == 1) {
+          inputVal.dropAllUses();
+          rewriter.eraseOp(inputOp);
+        }
         continue;
       }
     }
@@ -242,13 +220,12 @@ LogicalResult ClockDomainOp::canonicalize(ClockDomainOp op,
         !result.use_empty()) {
       rewriter.setInsertionPointAfter(op);
       unsigned resultIdx = cast<OpResult>(terminatorOperand).getResultNumber();
+      auto *clone = rewriter.clone(*defOp);
       if (defOp->hasOneUse()) {
-        defOp->remove();
-        rewriter.insert(defOp);
-      } else {
-        defOp = rewriter.clone(*defOp);
+        defOp->dropAllUses();
+        rewriter.eraseOp(defOp);
       }
-      rewriter.replaceAllUsesWith(result, defOp->getResult(resultIdx));
+      rewriter.replaceAllUsesWith(result, clone->getResult(resultIdx));
     }
   }
 

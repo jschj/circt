@@ -80,14 +80,44 @@ om.class @NestedField4() {
 
 // CHECK-LABEL: @ReferenceParameter
 // CHECK-SAME: !om.ref
-om.class @ReferenceParameter(%arg0: !om.ref) {
+// CHECK-SAME: !om.sym_ref
+om.class @ReferenceParameter(%arg0: !om.ref, %arg1: !om.sym_ref) {
+  // CHECK: om.class.field @myref
   om.class.field @myref, %arg0 : !om.ref
+  // CHECK: om.class.field @sym
+  om.class.field @sym, %arg1 : !om.sym_ref
 }
 
 // CHECK-LABEL: @ReferenceConstant
 om.class @ReferenceConstant() {
-  // CHECK: %[[const:.+]] = om.constant #om.ref<<@A::@inst_1>> : !om.ref
+  // CHECK: %[[const1:.+]] = om.constant #om.ref<<@A::@inst_1>> : !om.ref
   %0 = om.constant #om.ref<#hw.innerNameRef<@A::@inst_1>> : !om.ref
-  // CHECK: om.class.field @myref, %[[const]] : !om.ref
+  // CHECK: om.class.field @myref, %[[const1]] : !om.ref
   om.class.field @myref, %0 : !om.ref
+
+  // CHECK: %[[const2:.+]] = om.constant #om.sym_ref<@A> : !om.sym_ref
+  %1 = om.constant #om.sym_ref<@A> : !om.sym_ref
+  // CHECK: om.class.field @sym, %[[const2]] : !om.sym_ref
+  om.class.field @sym, %1 : !om.sym_ref
+}
+
+// CHECK-LABEL: @ListConstant
+om.class @ListConstant() {
+  // CHECK: %[[const1:.+]] = om.constant #om.list<i64, [42]> : !om.list<i64>
+  %0 = om.constant #om.list<i64, [42]> : !om.list<i64>
+  // CHECK: om.class.field @list_i64, %[[const1]] : !om.list<i64>
+  om.class.field @list_i64, %0 : !om.list<i64>
+
+  // CHECK: %[[const2:.+]] = om.constant #om.list<i32, []> : !om.list<i32>
+  %1 = om.constant #om.list<i32, []> : !om.list<i32>
+  // CHECK: om.class.field @list_i32, %[[const2]] : !om.list<i32>
+  om.class.field @list_i32, %1 : !om.list<i32>
+}
+
+// CHECK-LABEL: @String
+om.class @StringConstant() {
+  // CHECK: %[[const1:.+]] = om.constant "foo" : !om.string
+  %0 = om.constant "foo" : !om.string
+  // CHECK: om.class.field @string, %[[const1]] : !om.string
+  om.class.field @string, %0 : !om.string
 }

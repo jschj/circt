@@ -13,6 +13,7 @@
 #include "circt/Dialect/OM/OMOps.h"
 
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
 
 using namespace mlir;
 
@@ -56,6 +57,37 @@ ParseResult circt::om::ClassOp::parse(OpAsmParser &parser,
       ArrayAttr::get(parser.getContext(), SmallVector<Attribute>(argNames)));
 
   return success();
+}
+
+void circt::om::ClassOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+                               Twine name,
+                               ArrayRef<StringRef> formalParamNames) {
+  return build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
+               odsBuilder.getStrArrayAttr(formalParamNames));
+}
+
+circt::om::ClassOp circt::om::ClassOp::buildSimpleClassOp(
+    OpBuilder &odsBuilder, Location loc, Twine name,
+    ArrayRef<StringRef> formalParamNames, ArrayRef<StringRef> fieldNames,
+    ArrayRef<Type> fieldTypes) {
+  circt::om::ClassOp classOp = odsBuilder.create<circt::om::ClassOp>(
+      loc, odsBuilder.getStringAttr(name),
+      odsBuilder.getStrArrayAttr(formalParamNames));
+  Block *body = &classOp.getRegion().emplaceBlock();
+  auto prevLoc = odsBuilder.saveInsertionPoint();
+  odsBuilder.setInsertionPointToEnd(body);
+  for (auto [name, type] : llvm::zip(fieldNames, fieldTypes))
+    odsBuilder.create<circt::om::ClassFieldOp>(loc, name,
+                                               body->addArgument(type, loc));
+  odsBuilder.restoreInsertionPoint(prevLoc);
+
+  return classOp;
+}
+
+void circt::om::ClassOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+                               Twine name) {
+  return build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
+               odsBuilder.getStrArrayAttr({}));
 }
 
 void circt::om::ClassOp::print(OpAsmPrinter &printer) {
@@ -118,6 +150,16 @@ void circt::om::ClassOp::getAsmBlockArgumentNames(
 //===----------------------------------------------------------------------===//
 // ObjectOp
 //===----------------------------------------------------------------------===//
+
+void circt::om::ObjectOp::build(::mlir::OpBuilder &odsBuilder,
+                                ::mlir::OperationState &odsState,
+                                om::ClassOp classOp,
+                                ::mlir::ValueRange actualParams) {
+  return build(odsBuilder, odsState,
+               om::ClassType::get(odsBuilder.getContext(),
+                                  mlir::FlatSymbolRefAttr::get(classOp)),
+               classOp.getNameAttr(), actualParams);
+}
 
 LogicalResult
 circt::om::ObjectOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
@@ -221,6 +263,21 @@ circt::om::ObjectFieldOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
            << finalField.getType();
 
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ConstantOp
+//===----------------------------------------------------------------------===//
+
+void circt::om::ConstantOp::build(::mlir::OpBuilder &odsBuilder,
+                                  ::mlir::OperationState &odsState,
+                                  ::mlir::TypedAttr constVal) {
+  return build(odsBuilder, odsState, constVal.getType(), constVal);
+}
+
+OpFoldResult circt::om::ConstantOp::fold(FoldAdaptor adaptor) {
+  assert(adaptor.getOperands().empty() && "constant has no operands");
+  return getValueAttr();
 }
 
 //===----------------------------------------------------------------------===//

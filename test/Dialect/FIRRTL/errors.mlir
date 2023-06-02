@@ -473,6 +473,15 @@ firrtl.circuit "CombMemNonPassiveReturnType" {
 
 // -----
 
+firrtl.circuit "CombMemPerFieldSym" {
+  firrtl.module @CombMemPerFieldSym() {
+    // expected-error @below {{op does not support per-field inner symbols}}
+    %mem = chirrtl.combmem sym [<@x,1,public>] : !chirrtl.cmemory<bundle<a: uint<1>>, 1>
+  }
+}
+
+// -----
+
 firrtl.circuit "SeqMemInvalidReturnType" {
   firrtl.module @SeqMemInvalidReturnType() {
     // expected-error @+1 {{'chirrtl.seqmem' op result #0 must be a behavioral memory, but got '!firrtl.uint<1>'}}
@@ -486,6 +495,26 @@ firrtl.circuit "SeqMemNonPassiveReturnType" {
   firrtl.module @SeqMemNonPassiveReturnType() {
     // expected-error @+1 {{behavioral memory element type must be passive}}
     %mem = chirrtl.seqmem Undefined : !chirrtl.cmemory<bundle<a flip : uint<1>>, 1>
+  }
+}
+
+// -----
+
+firrtl.circuit "SeqMemPerFieldSym" {
+  firrtl.module @SeqMemPerFieldSym() {
+    // expected-error @below {{op does not support per-field inner symbols}}
+    %mem = chirrtl.seqmem sym [<@x,1,public>] Undefined : !chirrtl.cmemory<bundle<a: uint<1>>, 1>
+  }
+}
+
+// -----
+
+firrtl.circuit "SeqCombMemDupSym" {
+  firrtl.module @SeqCombMemDupSym() {
+    // expected-note @below {{see existing inner symbol definition here}}
+    %smem = chirrtl.seqmem sym @x Undefined : !chirrtl.cmemory<bundle<a: uint<1>>, 1>
+    // expected-error @below {{redefinition of inner symbol named 'x'}}
+    %cmem = chirrtl.combmem sym @x : !chirrtl.cmemory<bundle<a: uint<1>>, 1>
   }
 }
 
@@ -738,7 +767,7 @@ hw.hierpath private @nla [@A::@B::@C]
 
 
 firrtl.circuit "LowerToBind" {
- // expected-error @+1 {{the instance path cannot be empty/single element}}
+ // expected-error @+1 {{the instance path cannot be empty}}
 hw.hierpath private @NLA1 []
 hw.hierpath private @NLA2 [@LowerToBind::@s1]
 firrtl.module @InstanceLowerToBind() {}
@@ -1205,6 +1234,38 @@ firrtl.circuit "ForceableTypeMismatch" {
 
 // -----
 
+// Check rwprobe<const T> is rejected.
+firrtl.circuit "ForceableConstWire" {
+  firrtl.module @ForceableConstWire() {
+    // expected-error @below {{forceable reference base type cannot contain const}}
+    %w, %w_f = firrtl.wire forceable : !firrtl.const.uint, !firrtl.rwprobe<const.uint>
+  }
+}
+
+// -----
+
+// Check forceable declarations of const-type w/o explicit ref type are rejected.
+firrtl.circuit "ForceableConstNode" {
+  firrtl.module @ForceableConstNode() {
+    %w = firrtl.wire : !firrtl.const.uint
+    // expected-error @below {{cannot force a node of type}}
+    %n, %n_ref = firrtl.node %w forceable : !firrtl.const.uint
+  }
+}
+
+// -----
+
+// Check forceable declarations of const-type w/o explicit ref type are rejected.
+firrtl.circuit "ForceableBundleConstNode" {
+  firrtl.module @ForceableBundleConstNode() {
+    %w = firrtl.wire : !firrtl.bundle<a: const.uint>
+    // expected-error @below {{cannot force a node of type}}
+    %n, %n_ref = firrtl.node %w forceable : !firrtl.bundle<a: const.uint>
+  }
+}
+
+// -----
+
 firrtl.circuit "RefForceProbe" {
   firrtl.module @RefForceProbe() {
     %a = firrtl.wire : !firrtl.uint<1>
@@ -1232,7 +1293,7 @@ firrtl.circuit "RefReleaseProbe" {
 firrtl.circuit "EnumCreateNoCase" {
 firrtl.module @EnumCreateNoCase(in %in : !firrtl.uint<8>) {
   // expected-error @below {{unknown field SomeOther in enum type}}
-  %some = firrtl.enumcreate SomeOther(%in) : !firrtl.enum<None: uint<0>, Some: uint<8>>
+  %some = firrtl.enumcreate SomeOther(%in) : (!firrtl.uint<8>) -> !firrtl.enum<None: uint<0>, Some: uint<8>>
 }
 
 // -----
@@ -1241,7 +1302,7 @@ firrtl.circuit "EnumCreateWrongType" {
   // expected-note @below {{prior use here}}
 firrtl.module @EnumCreateWrongType(in %in : !firrtl.uint<7>) {
   // expected-error @below {{expects different type than prior uses}}
-  %some = firrtl.enumcreate Some(%in) : !firrtl.enum<None: uint<0>, Some: uint<8>>
+  %some = firrtl.enumcreate Some(%in) : (!firrtl.uint<8>) -> !firrtl.enum<None: uint<0>, Some: uint<8>>
 }
 
 // -----
@@ -1399,5 +1460,135 @@ firrtl.circuit "EnumNestedConstRegReset" {
 firrtl.module @EnumNestedConstRegReset(in %clock: !firrtl.clock, in %reset: !firrtl.asyncreset, in %resetVal: !firrtl.enum<a: const.uint<1>>) {
   // expected-error @+1 {{'firrtl.regreset' op result #0 must be a passive non-'const' base type that does not contain analog, but got '!firrtl.enum<a: const.uint<1>>'}}
   %r = firrtl.regreset %clock, %reset, %resetVal : !firrtl.clock, !firrtl.asyncreset, !firrtl.enum<a: const.uint<1>>, !firrtl.enum<a: const.uint<1>>
+}
+}
+
+// -----
+// const hardware firrtl.string is invalid
+
+firrtl.circuit "ConstHardwareString" {
+// expected-error @+1 {{strings cannot be const}}
+firrtl.module @ConstHardwareString(in %string: !firrtl.const.string) {}
+}
+
+// -----
+
+// Constcast non-const to const
+firrtl.circuit "ConstcastNonConstToConst" {
+  firrtl.module @ConstcastNonConstToConst(in %a: !firrtl.uint<1>) {
+    // expected-error @+1 {{'!firrtl.uint<1>' is not 'const'-castable to '!firrtl.const.uint<1>'}}
+    %b = firrtl.constCast %a : (!firrtl.uint<1>) -> !firrtl.const.uint<1>
+  }
+}
+
+// -----
+
+// Constcast non-const to const-containing
+firrtl.circuit "ConstcastNonConstToConst" {
+  firrtl.module @ConstcastNonConstToConst(in %a: !firrtl.bundle<a: uint<1>>) {
+    // expected-error @+1 {{'!firrtl.bundle<a: uint<1>>' is not 'const'-castable to '!firrtl.bundle<a: const.uint<1>>'}}
+    %b = firrtl.constCast %a : (!firrtl.bundle<a: uint<1>>) -> !firrtl.bundle<a: const.uint<1>>
+  }
+}
+
+// -----
+
+// Constcast different types
+firrtl.circuit "ConstcastDifferentTypes" {
+  firrtl.module @ConstcastDifferentTypes(in %a: !firrtl.const.uint<1>) {
+    // expected-error @+1 {{'!firrtl.const.uint<1>' is not 'const'-castable to '!firrtl.sint<1>'}}
+    %b = firrtl.constCast %a : (!firrtl.const.uint<1>) -> !firrtl.sint<1>
+  }
+}
+
+// -----
+
+// Bitcast non-const to const
+firrtl.circuit "BitcastNonConstToConst" {
+  firrtl.module @BitcastNonConstToConst(in %a: !firrtl.uint<1>) {
+    // expected-error @+1 {{cannot cast non-'const' input type '!firrtl.uint<1>' to 'const' result type '!firrtl.const.sint<1>'}}
+    %b = firrtl.bitcast %a : (!firrtl.uint<1>) -> !firrtl.const.sint<1>
+  }
+}
+
+// -----
+
+// Bitcast non-const to const-containing
+firrtl.circuit "BitcastNonConstToConstContaining" {
+  firrtl.module @BitcastNonConstToConstContaining(in %a: !firrtl.bundle<a: uint<1>>) {
+    // expected-error @+1 {{cannot cast non-'const' input type '!firrtl.bundle<a: uint<1>>' to 'const' result type '!firrtl.bundle<a: const.sint<1>>'}}
+    %b = firrtl.bitcast %a : (!firrtl.bundle<a: uint<1>>) -> !firrtl.bundle<a: const.sint<1>>
+  }
+}
+
+// -----
+
+// Uninferred width cast non-const to const
+firrtl.circuit "UninferredWidthCastNonConstToConst" {
+  firrtl.module @UninferredWidthCastNonConstToConst(in %a: !firrtl.uint) {
+    // expected-error @+1 {{operand constness must match}}
+    %b = firrtl.widthCast %a : (!firrtl.uint) -> !firrtl.const.uint<1>
+  }
+}
+
+// -----
+
+// Uninferred reset cast non-const to const
+firrtl.circuit "UninferredWidthCastNonConstToConst" {
+  firrtl.module @UninferredWidthCastNonConstToConst(in %a: !firrtl.reset) {
+    // expected-error @+1 {{operand constness must match}}
+    %b = firrtl.resetCast %a : (!firrtl.reset) -> !firrtl.const.asyncreset
+  }
+}
+
+// -----
+
+// Primitive ops with all 'const' operands must have a 'const' result type
+firrtl.circuit "PrimOpConstOperandsNonConstResult" {
+firrtl.module @PrimOpConstOperandsNonConstResult(in %a: !firrtl.const.uint<4>, in %b: !firrtl.const.uint<4>) {
+  // expected-error @below {{failed to infer returned types}}
+  // expected-error @+1 {{'firrtl.and' op inferred type(s) '!firrtl.const.uint<4>' are incompatible with return type(s) of operation '!firrtl.uint<4>'}}
+  %0 = firrtl.and %a, %b : (!firrtl.const.uint<4>, !firrtl.const.uint<4>) -> !firrtl.uint<4>
+}
+}
+
+// -----
+
+// Primitive ops with mixed 'const' operands must have a non-'const' result type
+firrtl.circuit "PrimOpMixedConstOperandsConstResult" {
+firrtl.module @PrimOpMixedConstOperandsConstResult(in %a: !firrtl.const.uint<4>, in %b: !firrtl.uint<4>) {
+  // expected-error @below {{failed to infer returned types}}
+  // expected-error @+1 {{'firrtl.and' op inferred type(s) '!firrtl.uint<4>' are incompatible with return type(s) of operation '!firrtl.const.uint<4>'}}
+  %0 = firrtl.and %a, %b : (!firrtl.const.uint<4>, !firrtl.uint<4>) -> !firrtl.const.uint<4>
+}
+}
+
+// -----
+
+// A 'const' bundle can only be created with 'const' operands
+firrtl.circuit "ConstBundleCreateNonConstOperands" {
+firrtl.module @ConstBundleCreateNonConstOperands(in %a: !firrtl.uint<1>) {
+  // expected-error @+1 {{type of element doesn't match bundle for field "a"}}
+  %0 = firrtl.bundlecreate %a : (!firrtl.uint<1>) -> !firrtl.const.bundle<a: uint<1>>
+}
+}
+
+// -----
+
+// A 'const' vector can only be created with 'const' operands
+firrtl.circuit "ConstVectorCreateNonConstOperands" {
+firrtl.module @ConstVectorCreateNonConstOperands(in %a: !firrtl.uint<1>) {
+  // expected-error @+1 {{type of element doesn't match vector element}}
+  %0 = firrtl.vectorcreate %a : (!firrtl.uint<1>) -> !firrtl.const.vector<uint<1>, 1>
+}
+}
+
+// -----
+
+// A 'const' enum can only be created with 'const' operands
+firrtl.circuit "ConstEnumCreateNonConstOperands" {
+firrtl.module @ConstEnumCreateNonConstOperands(in %a: !firrtl.uint<1>) {
+  // expected-error @+1 {{type of element doesn't match enum element}}
+  %0 = firrtl.enumcreate Some(%a) : (!firrtl.uint<1>) -> !firrtl.const.enum<None: uint<0>, Some: uint<1>>
 }
 }

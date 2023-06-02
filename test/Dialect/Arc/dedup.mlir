@@ -315,3 +315,85 @@ hw.module @DiffTypesBlockDedup(%x: i4) {
   // CHECK-NEXT: hw.output
 }
 // CHECK-NEXT: }
+
+//===----------------------------------------------------------------------===//
+
+// CHECK-LABEL: arc.define @StateAndCallA
+arc.define @StateAndCallA(%arg0: i4, %arg1: i4) -> i4 {
+  %0 = arc.call @NestedArc(%arg0, %arg1) {NestedArc} : (i4, i4) -> i4
+  arc.output %0 : i4
+}
+
+// CHECK-NOT: arc.define @StateAndCallB
+arc.define @StateAndCallB(%arg0: i4, %arg1: i4) -> i4 {
+  %0 = arc.call @NestedArc(%arg0, %arg1) {NestedArc} : (i4, i4) -> i4
+  arc.output %0 : i4
+}
+
+// CHECK-LABEL: arc.define @NestedArc
+arc.define @NestedArc(%arg0: i4, %arg1: i4) -> i4 {
+  %0 = comb.and %arg0, %arg1 {NestedArc} : i4
+  arc.output %0 : i4
+}
+
+// CHECK-LABEL: hw.module @StateAndCall
+hw.module @StateAndCall(%x: i4, %y: i4) {
+  // CHECK-NEXT: arc.state @StateAndCallA(%x, %y)
+  // CHECK-NEXT: arc.call @StateAndCallA(%y, %x)
+  // CHECK-NEXT: arc.call @StateAndCallA(%y, %x)
+  %0 = arc.state @StateAndCallB(%x, %y) lat 0 : (i4, i4) -> i4
+  %1 = arc.call @StateAndCallA(%y, %x) : (i4, i4) -> i4
+  %2 = arc.call @StateAndCallB(%y, %x) : (i4, i4) -> i4
+  // CHECK-NEXT: hw.output
+}
+// CHECK-NEXT: }
+
+//===----------------------------------------------------------------------===//
+
+// CHECK-LABEL: arc.define @CallA
+arc.define @CallA(%arg0: i4, %arg1: i4) -> i4 {
+  %0 = comb.and %arg0, %arg1 {RootCallArc} : i4
+  arc.output %0 : i4
+}
+
+// CHECK-NOT: arc.define @CallB
+arc.define @CallB(%arg0: i4, %arg1: i4) -> i4 {
+  %0 = comb.and %arg0, %arg1 {RootCallArc} : i4
+  arc.output %0 : i4
+}
+
+// CHECK-LABEL: arc.define @RootCallArc
+arc.define @RootCallArc(%arg0: i4, %arg1: i4) -> i4 {
+  // CHECK-NEXT: arc.call @CallA(%arg1, %arg0)
+  %0 = arc.call @CallA(%arg1, %arg0) {RootCallArc} : (i4, i4) -> i4
+  // CHECK-NEXT: arc.call @CallA(%arg0, %arg1)
+  %1 = arc.call @CallB(%arg0, %arg1) {RootCallArc} : (i4, i4) -> i4
+  %2 = comb.and %0, %1 {RootCallArc} : i4
+  arc.output %2 : i4
+}
+
+//===----------------------------------------------------------------------===//
+
+// CHECK-LABEL: arc.define @OutlineRegressionA
+arc.define @OutlineRegressionA(%arg0: i1, %arg1: i3) -> (i3, i3) {
+  %c0_i3 = hw.constant 0 : i3
+  %0 = comb.mux bin %arg0, %arg1, %c0_i3 {OutlineRegression} : i3
+  arc.output %0, %c0_i3 : i3, i3
+}
+
+// CHECK-NOT: arc.define @OutlineRegressionB
+arc.define @OutlineRegressionB(%arg0: i1, %arg1: i3) -> (i3, i3) {
+  %c0_i3 = hw.constant 0 : i3
+  %0 = comb.mux bin %arg0, %c0_i3, %arg1 {OutlineRegression} : i3
+  arc.output %0, %c0_i3 : i3, i3
+}
+
+// CHECK-LABEL: hw.module @OutlineRegression
+hw.module @OutlineRegression(%a: i1, %b: i3) {
+  // CHECK-NEXT: [[K0:%.+]] = hw.constant 0 : i3
+  // CHECK-NEXT: arc.call @OutlineRegressionA(%a, %b, [[K0]]) :
+  // CHECK-NEXT: [[K1:%.+]] = hw.constant 0 : i3
+  // CHECK-NEXT: arc.call @OutlineRegressionA(%a, [[K1]], %b) :
+  arc.call @OutlineRegressionA(%a, %b) : (i1, i3) -> (i3, i3)
+  arc.call @OutlineRegressionB(%a, %b) : (i1, i3) -> (i3, i3)
+}

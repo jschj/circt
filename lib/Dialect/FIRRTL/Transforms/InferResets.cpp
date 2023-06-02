@@ -44,14 +44,16 @@ using namespace firrtl;
 //===----------------------------------------------------------------------===//
 
 /// An absolute instance path.
-using InstancePathRef = ArrayRef<InstanceOp>;
-using InstancePathVec = SmallVector<InstanceOp>;
+using InstanceLike = circt::hw::HWInstanceLike;
+using InstancePathRef = ArrayRef<InstanceLike>;
+using InstancePathVec = SmallVector<InstanceLike>;
 
 template <typename T>
 static T &operator<<(T &os, InstancePathRef path) {
   os << "$root";
-  for (InstanceOp inst : path)
-    os << "/" << inst.getName() << ":" << inst.getModuleName();
+  for (InstanceLike inst : path)
+    os << "/" << inst.getInstanceName() << ":"
+       << inst.getReferencedModuleName();
   return os;
 }
 
@@ -60,7 +62,7 @@ static StringRef getTail(InstancePathRef path) {
   if (path.empty())
     return "$root";
   auto last = path.back();
-  return last.getName();
+  return last.getInstanceName();
 }
 #endif
 
@@ -756,7 +758,7 @@ void InferResetsPass::traceResets(CircuitOp circuit) {
             traceResets(op.getDataType(), op.getData(), 0, op.getDataType(),
                         op.getDataRef(), 0, op.getLoc());
         })
-        .Case<UninferredResetCastOp>([&](auto op) {
+        .Case<UninferredResetCastOp, ConstCastOp>([&](auto op) {
           traceResets(op.getResult(), op.getInput(), op.getLoc());
         })
         .Case<InvalidValueOp>([&](auto op) {
@@ -1123,6 +1125,17 @@ LogicalResult InferResetsPass::updateReset(ResetNetwork net, ResetKind kind) {
       uop.replaceAllUsesWith(uop.getInput());
       LLVM_DEBUG(llvm::dbgs() << "- Inferred " << uop << "\n");
       uop.erase();
+    } else if (auto constCastOp = dyn_cast<ConstCastOp>(wop)) {
+      // Propagate inferred reset types across const-casts of what was
+      // originally ResetType
+      if (constCastOp.getResult().getType().isa<ResetType>() &&
+          !constCastOp.getInput().getType().isa<ResetType>()) {
+        auto result = constCastOp.getResult();
+        result.setType(constCastOp.getInput().getType().getConstType(false));
+        for (auto *user : result.getUsers())
+          worklist.insert(user);
+        LLVM_DEBUG(llvm::dbgs() << "- Inferred " << constCastOp << "\n");
+      }
     }
   }
 
@@ -1398,7 +1411,7 @@ LogicalResult InferResetsPass::buildDomains(CircuitOp circuit) {
       else {
         note << "instance '";
         llvm::interleave(
-            path, [&](InstanceOp inst) { note << inst.getName(); },
+            path, [&](InstanceLike inst) { note << inst.getInstanceName(); },
             [&]() { note << "/"; });
         note << "'";
       }
@@ -1454,7 +1467,7 @@ void InferResetsPass::buildDomains(FModuleOp module,
     auto submodule = dyn_cast<FModuleOp>(*record->getTarget()->getModule());
     if (!submodule)
       continue;
-    childPath.push_back(cast<InstanceOp>(*record->getInstance()));
+    childPath.push_back(cast<InstanceLike>(*record->getInstance()));
     buildDomains(submodule, childPath, domain.reset, instGraph, indent + 1);
     childPath.pop_back();
   }

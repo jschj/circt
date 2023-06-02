@@ -90,15 +90,15 @@ void circt::firrtl::emitConnect(ImplicitLocOpBuilder &builder, Value dst,
 
   if ((dstType.hasUninferredReset() || srcType.hasUninferredReset()) &&
       dstType != srcType) {
-    src = builder.create<UninferredResetCastOp>(dstType, src);
-    srcType = dstType;
+    srcType = dstType.getConstType(srcType.isConst());
+    src = builder.create<UninferredResetCastOp>(srcType, src);
   }
 
   // Be sure uint, uint -> uint, (uir uint) since we are changing extneding
   // connect to identity.
   if (dstType.hasUninferredWidth() || srcType.hasUninferredWidth()) {
-    src = builder.create<UninferredWidthCastOp>(dstType, src);
-    srcType = dstType;
+    srcType = dstType.getConstType(srcType.isConst());
+    src = builder.create<UninferredWidthCastOp>(srcType, src);
   }
 
   // Handle ground types with possibly uninferred widths.
@@ -108,16 +108,25 @@ void circt::firrtl::emitConnect(ImplicitLocOpBuilder &builder, Value dst,
   // The source must be extended or truncated.
   if (dstWidth < srcWidth) {
     // firrtl.tail always returns uint even for sint operands.
-    IntType tmpType = dstType.cast<IntType>();
-    if (tmpType.isSigned())
-      tmpType = UIntType::get(dstType.getContext(), dstWidth);
+    IntType tmpType = dstType.cast<IntType>().getConstType(srcType.isConst());
+    bool isSignedDest = tmpType.isSigned();
+    if (isSignedDest)
+      tmpType =
+          UIntType::get(dstType.getContext(), dstWidth, srcType.isConst());
     src = builder.create<TailPrimOp>(tmpType, src, srcWidth - dstWidth);
     // Insert the cast back to signed if needed.
-    if (tmpType != dstType)
-      src = builder.create<AsSIntPrimOp>(dstType, src);
+    if (isSignedDest)
+      src = builder.create<AsSIntPrimOp>(
+          dstType.getConstType(tmpType.isConst()), src);
   } else if (srcWidth < dstWidth) {
     // Need to extend arg.
     src = builder.create<PadPrimOp>(src, dstWidth);
+  }
+
+  if (auto srcType = src.getType().cast<FIRRTLBaseType>();
+      srcType && dstType != srcType &&
+      areTypesConstCastable(dstType, srcType)) {
+    src = builder.create<ConstCastOp>(dstType, src);
   }
 
   // Strict connect requires the types to be completely equal, including
@@ -446,19 +455,27 @@ FieldRef circt::firrtl::getFieldRefFromValue(Value value) {
     if (!op)
       break;
 
-    if (auto subfieldOp = dyn_cast<SubfieldOp>(op)) {
-      value = subfieldOp.getInput();
-      auto bundleType = subfieldOp.getInput().getType();
-      // Rebase the current index on the parent field's index.
-      id += bundleType.getFieldID(subfieldOp.getFieldIndex());
-    } else if (auto subindexOp = dyn_cast<SubindexOp>(op)) {
-      value = subindexOp.getInput();
-      auto vecType = subindexOp.getInput().getType();
-      // Rebase the current index on the parent field's index.
-      id += vecType.getFieldID(subindexOp.getIndex());
-    } else {
+    auto handled = TypeSwitch<Operation *, bool>(op)
+                       .Case<SubfieldOp, OpenSubfieldOp>([&](auto subfieldOp) {
+                         value = subfieldOp.getInput();
+                         auto bundleType = subfieldOp.getInput().getType();
+                         // Rebase the current index on the parent field's
+                         // index.
+                         id +=
+                             bundleType.getFieldID(subfieldOp.getFieldIndex());
+                         return true;
+                       })
+                       .Case<SubindexOp, OpenSubindexOp>([&](auto subindexOp) {
+                         value = subindexOp.getInput();
+                         auto vecType = subindexOp.getInput().getType();
+                         // Rebase the current index on the parent field's
+                         // index.
+                         id += vecType.getFieldID(subindexOp.getIndex());
+                         return true;
+                       })
+                       .Default(false);
+    if (!handled)
       break;
-    }
   }
   return {value, id};
 }
@@ -627,7 +644,8 @@ StringAttr circt::firrtl::getOrAddInnerSym(
   if (nameHint.empty()) {
     if (auto nameAttr = op->getAttrOfType<StringAttr>("name"))
       nameHint = nameAttr.getValue();
-    else
+    // Ensure if the op name is also empty, nameHint is initialized.
+    if (nameHint.empty())
       nameHint = "sym";
   }
   auto name = getNamespace(mod).newName(nameHint);
