@@ -33,6 +33,17 @@ module {
     %ac = esi.adapt.vr2axistream %clk, %rst, %chan : !esi.axistream<!hw.struct<x: i3, y: i3>, i64>
     hw.output %ac : !esi.channel<!esi.axistream<!hw.struct<x: i3, y: i3>, i64>, AXIStream>
   }
+
+  hw.module @SPN(%clk: i1, %rst: i1, %inChan: !esi.channel<!esi.axistream<!hw.struct<a: i8, b: i8, c: i8, d: i8, e: i8>, i40>, AXIStream>) -> (outChan: !esi.channel<!esi.axistream<i64, i64>, AXIStream>) {
+    %inVrChan = esi.adapt.axistream2vr %clk, %rst, %inChan : !esi.axistream<!hw.struct<a: i8, b: i8, c: i8, d: i8, e: i8>, i40>
+    %data, %valid = esi.unwrap.vr %inVrChan, %ready : !hw.struct<a: i8, b: i8, c: i8, d: i8, e: i8>
+    %a = hw.struct_extract %data["a"] : !hw.struct<a: i8, b: i8, c: i8, d: i8, e: i8>
+    %concat = hw.array_create %a, %a, %a, %a, %a, %a, %a, %a : i8    
+    %computed = hw.bitcast %concat : (!hw.array<8 x i8>) -> i64
+    %outVrChan, %ready = esi.wrap.vr %computed, %valid : i64
+    %outAxisChan = esi.adapt.vr2axistream %clk, %rst, %outVrChan : !esi.axistream<i64, i64>
+    hw.output %outAxisChan : !esi.channel<!esi.axistream<i64, i64>, AXIStream>
+  }
 //
 //  hw.module @Stage4(%clk: i1, %rst: i1, %chan: !esi.channel<i8>) -> () {
 //    hw.output
