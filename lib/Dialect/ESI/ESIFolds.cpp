@@ -71,3 +71,41 @@ OpFoldResult UnwrapWindow::fold(FoldAdaptor) {
     return wrap.getFrame();
   return {};
 }
+
+LogicalResult WrapAXIStreamOp::canonicalize(WrapAXIStreamOp op,
+                                            PatternRewriter &rewriter) {
+  auto unwrap =
+    dyn_cast_or_null<UnwrapAXIStreamOp>(*op.getChanOutput().getUsers().begin());
+
+  if (!unwrap)
+    return failure();
+
+  return UnwrapAXIStreamOp::mergeAndErase(unwrap, op, rewriter);
+}
+
+LogicalResult UnwrapAXIStreamOp::mergeAndErase(UnwrapAXIStreamOp unwrap,
+                                               WrapAXIStreamOp wrap,
+                                               PatternRewriter &rewriter) {
+  // %chan, %ready = esi.wrap.axistream ...
+  // %valid, %data = esi.unwrap.axistream ... %otherReady ...
+  if (unwrap && wrap) {
+    // valid, data outputs are replaced with the wrap inputs
+    rewriter.replaceOp(unwrap, {wrap.getValid(), wrap.getData()});
+    // output channel is dropped, ready is sourced from the unwrap input
+    rewriter.replaceOp(wrap, {{}, unwrap.getReady()});
+    return success();
+  }
+
+  return failure();
+}
+
+LogicalResult UnwrapAXIStreamOp::canonicalize(UnwrapAXIStreamOp op,
+                                              PatternRewriter &rewriter) {
+  auto wrap =
+    dyn_cast_or_null<WrapAXIStreamOp>(op.getChanInput().getDefiningOp());
+
+  if (!wrap)
+    return failure();
+
+  return UnwrapAXIStreamOp::mergeAndErase(op, wrap, rewriter);
+}

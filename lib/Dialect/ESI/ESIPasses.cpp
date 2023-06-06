@@ -188,6 +188,76 @@ HWModuleExternOp ESIHWBuilder::declareCosimEndpointOp(Operation *symTable,
   return endpoint;
 }
 
+hw::HWModuleExternOp ESIHWBuilder::declareAXIStreamReceiver(Operation *symTable,
+                                                            AdaptAXIStreamToValidReadyOp op) {
+  Type tdataType =
+    op.getAxisChanInput().getType().getInner().cast<AXIStreamType>().getAxisBusType();
+  Type dataOutType = op.getRawValidReadyType();
+
+  // Since this module has parameterized widths on the a input and x output,
+  // give the extern declation a None type since nothing else makes sense.
+  // Will be refining this when we decide how to better handle parameterized
+  // types and ops.
+  size_t argn = 0;
+  size_t resn = 0;
+  llvm::SmallVector<PortInfo> ports = {
+      {clk, PortDirection::INPUT, getI1Type(), argn++},
+      {rst, PortDirection::INPUT, getI1Type(), argn++}};
+
+  auto str = [&](StringRef s) { return StringAttr::get(getContext(), s); };
+  
+  ports.push_back({str("TVALID"), PortDirection::INPUT, getI1Type(), argn++});
+  ports.push_back({str("TREADY"), PortDirection::OUTPUT, getI1Type(), resn++});
+  ports.push_back({str("TDATA"), PortDirection::INPUT, tdataType, argn++});
+  
+  ports.push_back({str("data_out"), PortDirection::OUTPUT, dataOutType, resn++});
+  ports.push_back({str("data_out_valid"), PortDirection::OUTPUT, getI1Type(), resn++});
+  ports.push_back({str("data_out_ready"), PortDirection::INPUT, getI1Type(), argn++});
+
+  // TODO: parameter list
+  auto mod = create<HWModuleExternOp>(
+    constructUniqueSymbol(symTable, "ESI_AXIStreamReceiver"), ports,
+    "ESI_AXIStreamReceiver"
+  );
+
+  return mod;
+}
+
+hw::HWModuleExternOp ESIHWBuilder::delareAXIStreamSender(Operation *symTable,
+                                                         AdaptValidReadyToAXIStreamOp op) {
+  Type tdataType =
+    op.getAxisChanOutput().getType().getInner().cast<AXIStreamType>().getAxisBusType();
+  Type dataOutType = op.getRawValidReadyType();
+
+  // Since this module has parameterized widths on the a input and x output,
+  // give the extern declation a None type since nothing else makes sense.
+  // Will be refining this when we decide how to better handle parameterized
+  // types and ops.
+  size_t argn = 0;
+  size_t resn = 0;
+  llvm::SmallVector<PortInfo> ports = {
+      {clk, PortDirection::INPUT, getI1Type(), argn++},
+      {rst, PortDirection::INPUT, getI1Type(), argn++}};
+
+  auto str = [&](StringRef s) { return StringAttr::get(getContext(), s); };
+  
+  ports.push_back({str("TVALID"), PortDirection::OUTPUT, getI1Type(), resn++});
+  ports.push_back({str("TREADY"), PortDirection::INPUT, getI1Type(), argn++});
+  ports.push_back({str("TDATA"), PortDirection::OUTPUT, tdataType, resn++});
+  
+  ports.push_back({str("data_in"), PortDirection::INPUT, dataOutType, argn++});
+  ports.push_back({str("data_in_valid"), PortDirection::INPUT, getI1Type(), argn++});
+  ports.push_back({str("data_in_ready"), PortDirection::OUTPUT, getI1Type(), resn++});
+
+  // TODO: parameter list
+  auto mod = create<HWModuleExternOp>(
+    constructUniqueSymbol(symTable, "ESI_AXIStreamSender"), ports,
+    "ESI_AXIStreamSender"
+  );
+
+  return mod;
+}
+
 /// Return the InterfaceType which corresponds to an ESI port type. If it
 /// doesn't exist in the cache, build the InterfaceOp and the corresponding
 /// type.

@@ -17,6 +17,7 @@
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/EnumAttr.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "circt/Dialect/HW/HWTypes.td"
 
 
 class ESI_Port<string name> : TypeDef<ESI_Dialect, name> {}
@@ -26,11 +27,31 @@ def ChannelSignalingValidReady : I32EnumAttrCase<"ValidReady", 0>;
 // FIFO interface with a read latency of zero. Very similiar to valid-ready, but
 // cannot assert ready if data is not available.
 def ChannelSignalingFIFO0      : I32EnumAttrCase<"FIFO0",      1>;
+// AXI Stream interface. In general very similiar to valid-ready.
+def ChannelSignalingAXIStream  : I32EnumAttrCase<"AXIStream",  2>;
+
 def ChannelSignaling : I32EnumAttr<
     "ChannelSignaling",
     "ESI channel wire signaling standard",
-    [ChannelSignalingValidReady, ChannelSignalingFIFO0]>{
+    [ChannelSignalingValidReady, ChannelSignalingFIFO0, ChannelSignalingAXIStream]>{
   let cppNamespace = "::circt::esi";
+}
+
+def AXIStreamType : TypeDef<ESI_Dialect, "AXIStream"> {
+  let summary = "";
+  let description = "";
+
+  let mnemonic = "axistream";
+  let parameters = (ins "Type":$inner, "::mlir::IntegerType":$axisBusType);
+
+  let assemblyFormat = "`<` $inner `,` $axisBusType `>`";
+
+  let builders = [
+    TypeBuilder<(ins "Type":$innerType, "uint64_t":$axisWidth), [{
+        auto busType = ::mlir::IntegerType::get($_ctxt, axisWidth, ::mlir::IntegerType::Signless);
+        return Base::get($_ctxt, innerType, busType);
+      }]>,
+  ];
 }
 
 def ChannelType : ESI_Port<"Channel"> {
@@ -64,6 +85,15 @@ def ChannelType : ESI_Port<"Channel"> {
                          ::circt::esi::ChannelSignaling::ValidReady);
       }]>,
   ];
+
+  let extraClassDeclaration = [{
+    Type getPayloadType() {
+      if (getSignaling() == ::circt::esi::ChannelSignaling::AXIStream)
+        return getInner().cast<AXIStreamType>().getInner();
+      else
+        return getInner();
+    }
+  }];
 }
 
 //=========
@@ -144,6 +174,61 @@ def UnwrapFIFOOp : ESI_Op<"unwrap.fifo", [
 
   let extraClassDeclaration = [{
     static LogicalResult mergeAndErase(UnwrapFIFOOp, WrapFIFOOp, PatternRewriter&);
+  }];
+}
+
+def WrapAXIStreamOp : ESI_Op<"wrap.axistream", [
+  DeclareOpInterfaceMethods<ChannelOpInterface>
+]> {
+  let summary = "Wrap a value into an ESI port with AXI Stream signaling";
+
+  let arguments = (ins
+    I1:$valid,
+    HWIntegerType:$data
+  );
+
+  let results = (outs
+    ChannelType:$chanOutput,
+    I1:$ready
+  );
+
+  let assemblyFormat = [{
+    $valid `,` $data
+      attr-dict `:` custom<WrapAXIStreamType>(type($data), type($chanOutput))
+  }];
+
+  let builders = [
+    OpBuilder<(ins "mlir::Value":$valid, "mlir::Value":$data, "mlir::Type":$dataType)>
+  ];
+
+  let hasVerifier = 1;
+  let hasCanonicalizeMethod = true;
+}
+
+def UnwrapAXIStreamOp : ESI_Op<"unwrap.axistream", [
+    DeclareOpInterfaceMethods<ChannelOpInterface>
+  ]> {
+  let summary = "Unwrap a value from an ESI port into AXI Stream interface";
+
+  let arguments = (ins ChannelType:$chanInput, I1:$ready);
+  let results = (outs
+    I1:$valid,
+    HWIntegerType:$data
+  );
+
+  let assemblyFormat = [{
+    $chanInput `,` $ready attr-dict `:` custom<UnwrapAXIStreamType>(type($chanInput), type($data))
+  }];
+
+  let hasVerifier = 1;
+  let hasCanonicalizeMethod = true;
+
+  let builders = [
+    OpBuilder<(ins "mlir::Value":$chanInput, "mlir::Value":$ready)>
+  ];
+
+  let extraClassDeclaration = [{
+    static LogicalResult mergeAndErase(UnwrapAXIStreamOp, WrapAXIStreamOp, PatternRewriter&);
   }];
 }
 

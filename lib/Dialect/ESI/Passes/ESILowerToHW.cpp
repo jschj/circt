@@ -470,6 +470,140 @@ public:
 };
 } // namespace
 
+namespace {
+
+struct AdaptAXIStreamToValidReadyLowering : public OpConversionPattern<AdaptAXIStreamToValidReadyOp> {
+public:
+  AdaptAXIStreamToValidReadyLowering(ESIHWBuilder &builder, MLIRContext *ctxt)
+    : OpConversionPattern(ctxt), builder(builder) {}
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(AdaptAXIStreamToValidReadyOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    // 1. unwrap AXIStream
+    // 2. ESI_AXIStreamReceiver
+    // 3. wrap valid ready
+
+    auto loc = op.getLoc();
+
+    circt::BackedgeBuilder back(rewriter, loc);
+    circt::Backedge wrapReady = back.get(rewriter.getI1Type());
+
+    auto unwrap = rewriter.create<UnwrapAXIStreamOp>(
+      loc, op.getAxisChanInput(), wrapReady
+    );
+
+    // ESI_AXIStreamReceiver
+    Operation *symTable = op->getParentWithTrait<OpTrait::SymbolTable>();
+    auto mod = builder.declareAXIStreamReceiver(symTable, op);
+
+    circt::Backedge dataOutReady = back.get(rewriter.getI1Type());
+
+    llvm::SmallVector<Value> operands{
+      op.getClk(),
+      op.getRst(),
+      // AXIStream channel
+      unwrap.getValid(),
+      unwrap.getData(),
+      // ValidReady channel
+      dataOutReady
+    };
+
+    // TODO
+    ArrayAttr params;
+
+    auto inst = rewriter.create<InstanceOp>(loc, mod, "ESI_AXIStreamReceiver", operands, params);
+    wrapReady.setValue(inst.getResult(0));
+    Value dataOut = inst.getResult(1);
+    Value dataOutValid = inst.getResult(2);
+
+    Value castDataOut = rewriter.create<BitcastOp>(
+      loc, op.getAxisChanInput().getType().cast<ChannelType>().getPayloadType(), dataOut
+    ).getResult();
+
+    // wrap valid ready
+    auto wrap = rewriter.create<WrapValidReadyOp>(loc, castDataOut, dataOutValid);
+    dataOutReady.setValue(wrap.getReady());
+
+    rewriter.replaceOp(op, wrap.getChanOutput());
+
+    wrap.getChanOutput().getType().dump();
+
+    return success();
+  }
+private:
+  ESIHWBuilder& builder;
+};
+
+struct AdaptValidReadyToAXIStreamLowering : public OpConversionPattern<AdaptValidReadyToAXIStreamOp> {
+public:
+  AdaptValidReadyToAXIStreamLowering(ESIHWBuilder &builder, MLIRContext *ctxt)
+    : OpConversionPattern(ctxt), builder(builder) {}
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(AdaptValidReadyToAXIStreamOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    // 1. unwrap valid ready
+    // 2. ESI_AXIStreamSender
+    // 3. wrap AXIStream
+
+    auto loc = op.getLoc();
+
+    circt::BackedgeBuilder back(rewriter, loc);
+    circt::Backedge unwrapReady = back.get(rewriter.getI1Type());
+    circt::Backedge tready = back.get(rewriter.getI1Type());
+
+    auto unwrap =
+      rewriter.create<UnwrapValidReadyOp>(loc, op.getVrChanInput(), unwrapReady);
+
+    Operation *symTable = op->getParentWithTrait<OpTrait::SymbolTable>();
+    auto mod = builder.delareAXIStreamSender(symTable, op);
+
+    Value unwrapOutput = rewriter.create<BitcastOp>(
+      loc, op.getRawValidReadyType(), unwrap.getRawOutput()
+    ).getResult();
+
+    llvm::SmallVector<Value> operands{
+      op.getClk(),
+      op.getRst(),
+      // AXIStream channel
+      tready,
+      // ValidReady channel
+      unwrapOutput,
+      unwrap.getValid()
+    };
+
+    // TODO
+    ArrayAttr params;
+
+    auto inst =
+      rewriter.create<InstanceOp>(loc, mod, "ESI_AXIStreamSender", operands, params);
+    
+    unwrapReady.setValue(inst.getResult(2));
+
+    Value tvalid = inst.getResult(0);
+    Value tdata = inst.getResult(1);
+    Type axiStreamType = op.getAxisChanOutput().getType().cast<ChannelType>().getInner();
+
+    auto wrap =
+      rewriter.create<WrapAXIStreamOp>(loc, tvalid, tdata, axiStreamType);
+
+    tready.setValue(wrap.getReady());
+
+    wrap.getChanOutput().dump();
+
+    rewriter.replaceOp(op, wrap.getChanOutput());
+
+    return success();
+  }
+private:
+  ESIHWBuilder& builder;
+};
+
+} // anonymous namespace
+
 void ESItoHWPass::runOnOperation() {
   auto top = getOperation();
   auto *ctxt = &getContext();
@@ -481,9 +615,16 @@ void ESItoHWPass::runOnOperation() {
   pass1Target.addLegalDialect<SVDialect>();
   pass1Target.addLegalOp<WrapValidReadyOp, UnwrapValidReadyOp>();
   pass1Target.addLegalOp<CapnpDecodeOp, CapnpEncodeOp>();
+ 
+  // TODO: remove these later
+  pass1Target.addLegalOp<WrapAXIStreamOp>();
+  pass1Target.addLegalOp<UnwrapAXIStreamOp>();
+  //pass1Target.addLegalOp<AdaptValidReadyToAXIStreamOp>();
 
   pass1Target.addIllegalOp<WrapSVInterfaceOp, UnwrapSVInterfaceOp>();
   pass1Target.addIllegalOp<PipelineStageOp>();
+  pass1Target.addIllegalOp<AdaptAXIStreamToValidReadyOp>();
+  pass1Target.addIllegalOp<AdaptValidReadyToAXIStreamOp>();
 
   // Add all the conversion patterns.
   ESIHWBuilder esiBuilder(top);
@@ -493,6 +634,8 @@ void ESItoHWPass::runOnOperation() {
   pass1Patterns.insert<UnwrapInterfaceLower>(ctxt);
   pass1Patterns.insert<CosimLowering>(esiBuilder);
   pass1Patterns.insert<NullSourceOpLowering>(ctxt);
+  pass1Patterns.insert<AdaptAXIStreamToValidReadyLowering>(esiBuilder, ctxt);
+  pass1Patterns.insert<AdaptValidReadyToAXIStreamLowering>(esiBuilder, ctxt);
 
   // Run the conversion.
   if (failed(
@@ -508,6 +651,8 @@ void ESItoHWPass::runOnOperation() {
   RewritePatternSet pass2Patterns(ctxt);
   pass2Patterns.insert<CanonicalizerOpLowering<UnwrapFIFOOp>>(ctxt);
   pass2Patterns.insert<CanonicalizerOpLowering<WrapFIFOOp>>(ctxt);
+  pass2Patterns.insert<CanonicalizerOpLowering<UnwrapAXIStreamOp>>(ctxt);
+  pass2Patterns.insert<CanonicalizerOpLowering<WrapAXIStreamOp>>(ctxt);
   pass2Patterns.insert<RemoveWrapUnwrap>(ctxt);
   pass2Patterns.insert<EncoderLowering>(ctxt);
   pass2Patterns.insert<DecoderLowering>(ctxt);

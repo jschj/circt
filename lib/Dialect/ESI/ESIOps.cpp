@@ -240,6 +240,140 @@ UnwrapFIFOOp::inferReturnTypes(MLIRContext *context, std::optional<Location>,
   return success();
 }
 
+ParseResult parseWrapAXIStreamType(OpAsmParser& p, Type& dataType, Type& chanOutputType) {
+  auto loc = p.getCurrentLocation();
+  
+  IntegerType dType;
+  if (p.parseType(dType))
+    return failure();
+  if (dType.getIntOrFloatBitWidth() % 8 != 0)
+    return p.emitError(loc, "AXIStream data type must be a multiple of 8 bits wide");
+
+  if (p.parseComma())
+    return failure();
+
+  ChannelType chType;
+  loc = p.getCurrentLocation();
+  if (p.parseType(chType))
+    return failure();
+  if (chType.getSignaling() != ChannelSignaling::AXIStream)
+    return p.emitError(loc, "can only wrap into AXIStream type");
+
+  //auto intType = IntegerType::get(p.getBuilder().getContext(), dType.getIntOrFloatBitWidth() / 8, IntegerType::Signless);
+
+  dataType = dType;
+  chanOutputType = chType;
+
+  return success();
+}
+
+void printWrapAXIStreamType(OpAsmPrinter &p, WrapAXIStreamOp wrap, Type dataType, Type chanOutputType) {
+  p << dataType << ", " << chanOutputType;
+}
+
+void WrapAXIStreamOp::build(OpBuilder &odsBuilder, OperationState &odsState, Value valid, Value data, Type dataType) {
+  auto chanType = ChannelType::get(odsBuilder.getContext(), dataType, ChannelSignaling::AXIStream);
+  build(odsBuilder, odsState, {chanType, odsBuilder.getI1Type()}, valid, data);
+}
+
+LogicalResult WrapAXIStreamOp::verify() {
+  if (!getChanOutput().getType().cast<ChannelType>().getInner().isa<AXIStreamType>()) {
+    return emitOpError("inner type must be of AXIStreamType");
+  }
+
+  return success();
+}
+
+circt::esi::ChannelType WrapAXIStreamOp::channelType() {
+  return getChanOutput().getType().cast<circt::esi::ChannelType>();
+}
+
+
+
+
+circt::esi::ChannelType UnwrapAXIStreamOp::channelType() {
+  return getChanInput().getType().cast<circt::esi::ChannelType>();
+}
+
+LogicalResult UnwrapAXIStreamOp::verify() {
+  if (getChanInput().getType().getSignaling() != ChannelSignaling::AXIStream)
+    return emitOpError("only supports AXIStream signaling");
+  return success();
+}
+
+void UnwrapAXIStreamOp::build(OpBuilder &b, OperationState &state, Value chanInput, Value ready) {
+  Type axisBusType =
+    chanInput.getType().cast<ChannelType>().getInner().cast<AXIStreamType>().getAxisBusType();
+  build(b, state, {b.getI1Type(), axisBusType}, chanInput, ready);
+}
+
+ParseResult parseUnwrapAXIStreamType(OpAsmParser& p, Type& chanInputType, Type& dataType) {
+  auto loc = p.getCurrentLocation();
+
+  AXIStreamType streamType;
+
+  if (p.parseType(streamType))
+    return failure();
+
+  if (streamType.getAxisBusType().getIntOrFloatBitWidth() % 8 != 0)
+    return p.emitError(loc, "AXIStream data type must be a multiple of 8 bits wide");
+
+  chanInputType = ChannelType::get(p.getBuilder().getContext(), streamType, ChannelSignaling::AXIStream);
+  dataType = streamType.getAxisBusType();
+
+  return success();
+}
+
+void printUnwrapAXIStreamType(OpAsmPrinter &p, UnwrapAXIStreamOp unwrap, Type chanInputType, Type dataType) {
+  p << chanInputType;
+}
+
+ParseResult parseAdaptAXIStreamToValidReadyType(OpAsmParser& p, Type& axisChanInputType, Type& vrChanOutputType) {
+  auto loc = p.getCurrentLocation();
+  
+  AXIStreamType streamType;
+
+  if (p.parseType(streamType))
+    return failure();
+
+  if (streamType.getAxisBusType().getIntOrFloatBitWidth() % 8 != 0)
+    return p.emitError(loc, "AXIStream data type must be a multiple of 8 bits wide");
+
+  Type innerType = streamType.getInner();
+
+  axisChanInputType = ChannelType::get(p.getBuilder().getContext(), streamType, ChannelSignaling::AXIStream);
+  vrChanOutputType = ChannelType::get(p.getBuilder().getContext(), innerType, ChannelSignaling::ValidReady);
+
+  return success();
+}
+
+void printAdaptAXIStreamToValidReadyType(OpAsmPrinter &p, AdaptAXIStreamToValidReadyOp op, Type axisChanInputType, Type vrChanOutputType) {
+  p << axisChanInputType.cast<ChannelType>().getInner();
+}
+
+ParseResult parseAdaptValidReadyToAXIStreamType(OpAsmParser& p, Type& vrChanInputType, Type& axisChanOutputType) {
+  auto loc = p.getCurrentLocation();
+
+  AXIStreamType streamType;
+
+  if (p.parseType(streamType))
+    return failure();
+
+  if (streamType.getAxisBusType().getIntOrFloatBitWidth() % 8 != 0)
+    return p.emitError(loc, "AXIStream data type must be a multiple of 8 bits wide");
+
+  Type innerType = streamType.getInner();
+
+  vrChanInputType = ChannelType::get(p.getBuilder().getContext(), innerType, ChannelSignaling::ValidReady);
+  axisChanOutputType = ChannelType::get(p.getBuilder().getContext(), streamType, ChannelSignaling::AXIStream);
+
+  return success();
+}
+
+void printAdaptValidReadyToAXIStreamType(OpAsmPrinter &p, AdaptValidReadyToAXIStreamOp op, Type vrChanInputType, Type axisChanOutputType) {
+  p << axisChanOutputType.cast<ChannelType>().getInner();
+}
+
 /// If 'iface' looks like an ESI interface, return the inner data type.
 static Type getEsiDataType(circt::sv::InterfaceOp iface) {
   using namespace circt::sv;

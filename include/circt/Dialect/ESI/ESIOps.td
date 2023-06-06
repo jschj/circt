@@ -129,3 +129,58 @@ def NullSourceOp : ESI_Physical_Op<"null", [Pure]> {
 
   let assemblyFormat = [{ attr-dict `:` qualified(type($out)) }];
 }
+
+def AdaptAXIStreamToValidReadyOp : ESI_Op<"adapt.axistream2vr", [Pure]> {
+  let summary = "Adapt a value from an AXI Stream interface to a valid-ready interface";
+  let description = [{
+    Lowering this operation to HW will implement logic to convert the AXI data bytes to
+    the specified result type. TSTRB, TKEEP, TID, TDEST, TUSER and TWAKEUP are
+    currently not supported. A single transfer contains a single struct instance.
+    This implementation might deviate from some of the recommendations in the spec.
+
+    Example:
+
+    ```mlir
+    %vrChanOutput = esi.adapt.axistream2vr %axisChanInput : !esi.axistream<!hw.struct<a: i8, b: i5>, i64>
+    ```
+  }];
+
+  let arguments = (ins I1:$clk, I1:$rst, ChannelType:$axisChanInput);
+  let results = (outs ChannelType:$vrChanOutput);
+
+
+
+  let assemblyFormat = [{
+    $clk `,` $rst `,` $axisChanInput attr-dict `:`
+      custom<AdaptAXIStreamToValidReadyType>(type($axisChanInput), type($vrChanOutput))
+  }];
+
+  let extraClassDeclaration = [{
+    Type getRawValidReadyType() {
+      Type inner = getVrChanOutput().getType().cast<ChannelType>().getInner();
+      size_t width = circt::hw::getBitWidth(inner);
+      return IntegerType::get(getContext(), width, IntegerType::Signless);
+    }
+  }];
+}
+
+def AdaptValidReadyToAXIStreamOp : ESI_Op<"adapt.vr2axistream", [Pure]> {
+  let summary = "";
+  let description = "";
+
+  let arguments = (ins I1:$clk, I1:$rst, ChannelType:$vrChanInput);
+  let results = (outs ChannelType:$axisChanOutput);
+
+  let assemblyFormat = [{
+    $clk `,` $rst `,` $vrChanInput attr-dict `:`
+      custom<AdaptValidReadyToAXIStreamType>(type($vrChanInput), type($axisChanOutput))
+  }];
+
+  let extraClassDeclaration = [{
+    Type getRawValidReadyType() {
+      Type inner = getVrChanInput().getType().cast<ChannelType>().getInner();
+      size_t width = circt::hw::getBitWidth(inner);
+      return IntegerType::get(getContext(), width, IntegerType::Signless);
+    }
+  }];
+}

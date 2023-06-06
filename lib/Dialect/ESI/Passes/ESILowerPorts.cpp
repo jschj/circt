@@ -345,6 +345,41 @@ private:
   PortInfo rdenPort;
   PortInfo emptyPort;
 };
+
+// Implement the AXIStream signaling standard.
+class AXIStream : public SignalingStandard {
+public:
+  using SignalingStandard::SignalingStandard;
+
+  AXIStream(ChannelRewriter &rewriter, PortInfo origPort):
+    SignalingStandard(rewriter, origPort) {
+    innerChanType = origPort.type.cast<ChannelType>().getInner();
+    byteFlattenedType = flattenType(innerChanType);
+    axisBusType = IntegerType::get(getContext(), 128, IntegerType::Signless);
+  }
+
+  void mapInputSignals(OpBuilder &b, Operation *inst, Value instValue,
+                       SmallVectorImpl<Value> &newOperands,
+                       ArrayRef<Backedge> newResults) override;
+  void mapOutputSignals(OpBuilder &b, Operation *inst, Value instValue,
+                        SmallVectorImpl<Value> &newOperands,
+                        ArrayRef<Backedge> newResults) override;
+
+private:
+  void buildInputSignals() override;
+  void buildOutputSignals() override;
+
+  static Type flattenType(Type hwType);
+
+  Type innerChanType;
+  Type byteFlattenedType;
+  Type axisBusType;
+
+  PortInfo validPort, dataPort, strbPort, keepPort,
+    lastPort, idPort, destPort, userPort, wakeupPort;
+  PortInfo readyPort;
+};
+
 } // namespace
 
 Value ChannelRewriter::createNewInput(PortInfo origPort, const Twine &suffix,
@@ -405,6 +440,8 @@ LogicalResult ChannelRewriter::rewriteChannelsOnModule() {
         loweredPorts.emplace_back(new ValidReady(*this, port));
       } else if (signaling == ChannelSignaling::FIFO0) {
         loweredPorts.emplace_back(new FIFO(*this, port));
+      } else if (signaling == ChannelSignaling::AXIStream) {
+        loweredPorts.emplace_back(new AXIStream(*this, port));
       } else {
         auto error =
             mod.emitOpError("encountered unknown signaling standard on port '")
@@ -604,6 +641,66 @@ void FIFO::mapOutputSignals(OpBuilder &b, Operation *inst, Value instValue,
       newResults[emptyPort.argNum]);
   inst->getResult(origPort.argNum).replaceAllUsesWith(wrap.getChanOutput());
   newOperands[rdenPort.argNum] = wrap.getRden();
+}
+
+void AXIStream::mapInputSignals(OpBuilder &b, Operation *inst, Value instValue,
+                                SmallVectorImpl<Value> &newOperands,
+                                ArrayRef<Backedge> newResults) {
+  assert(false && "not implemented");
+}
+
+void AXIStream::mapOutputSignals(OpBuilder &b, Operation *inst, Value instValue,
+                                 SmallVectorImpl<Value> &newOperands,
+                                 ArrayRef<Backedge> newResults) {
+  assert(false && "not implemented");
+}
+
+void AXIStream::buildInputSignals() {
+  assert(false && "not implemented");
+  // the original port is an input port
+
+  Type i1 = IntegerType::get(getContext(), 1, IntegerType::Signless);
+  Type i8 = IntegerType::get(getContext(), 8, IntegerType::Signless);
+  Type iN = IntegerType::get(getContext(), axisBusType.getIntOrFloatBitWidth() / 8, IntegerType::Signless);
+
+  Value valid   = rewriter.createNewInput(origPort, "_TVALID",  i1, validPort);
+  Value data    = rewriter.createNewInput(origPort, "_TDATA",   axisBusType, dataPort);
+  Value strb    = rewriter.createNewInput(origPort, "_TSTRB",   iN, strbPort);
+  Value keep    = rewriter.createNewInput(origPort, "_TKEEP",   iN, keepPort);
+  Value last    = rewriter.createNewInput(origPort, "_TLAST",   i1, lastPort);
+  Value id      = rewriter.createNewInput(origPort, "_TID",     i8, idPort);
+  Value dest    = rewriter.createNewInput(origPort, "_TDEST",   i8, destPort);
+  Value user    = rewriter.createNewInput(origPort, "_TUSER",   i8, userPort);
+  Value wakeup  = rewriter.createNewInput(origPort, "_TWAKEUP", i1, wakeupPort);
+
+  /*
+  Value ready;
+  if (body) {
+    ImplicitLocOpBuilder b(origPort.loc, body, body->begin());
+    // Build the ESI wrap operation to translate the lowered signals to what
+    // they were. (A later pass takes care of eliminating the ESI ops.)
+    auto wrap = b.create<WrapAXIStreamOp>(
+      // TODO: not sure why ready type needs be specified here
+      TypeRange{origPort.type, i1},
+      valid, data, strb, keep, last, id, dest, user, wakeup
+    );
+    ready = wrap.getReady();
+    // Replace uses of the old ESI port argument with the new one from the
+    // wrap.
+    body->getArgument(origPort.argNum).replaceAllUsesWith(wrap.getChanOutput());
+  }
+
+  rewriter.createNewOutput(origPort, "_TREADY", i1, ready, readyPort);
+   */
+}
+
+void AXIStream::buildOutputSignals() {
+  assert(false && "not implemented");
+}
+
+Type AXIStream::flattenType(Type hwType) {
+  // TODO: implement
+  return hwType;
 }
 
 /// Update an instance of an updated module by adding `esi.[un]wrap.vr`

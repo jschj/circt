@@ -54,6 +54,10 @@ public:
   hw::HWModuleExternOp
   declareCosimEndpointOp(Operation *symTable, Type sendType,
                          Type recvType) LLVM_ATTRIBUTE_UNUSED;
+  hw::HWModuleExternOp declareAXIStreamReceiver(Operation *symTable,
+                                                AdaptAXIStreamToValidReadyOp op);
+  hw::HWModuleExternOp delareAXIStreamSender(Operation *symTable,
+                                             AdaptValidReadyToAXIStreamOp op);
 
   sv::InterfaceOp getOrConstructInterface(ChannelType);
   sv::InterfaceOp constructInterface(ChannelType);
