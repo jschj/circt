@@ -615,11 +615,7 @@ void ESItoHWPass::runOnOperation() {
   pass1Target.addLegalDialect<SVDialect>();
   pass1Target.addLegalOp<WrapValidReadyOp, UnwrapValidReadyOp>();
   pass1Target.addLegalOp<CapnpDecodeOp, CapnpEncodeOp>();
- 
-  // TODO: remove these later
-  pass1Target.addLegalOp<WrapAXIStreamOp>();
-  pass1Target.addLegalOp<UnwrapAXIStreamOp>();
-  //pass1Target.addLegalOp<AdaptValidReadyToAXIStreamOp>();
+  pass1Target.addLegalOp<WrapAXIStreamOp, UnwrapAXIStreamOp>();
 
   pass1Target.addIllegalOp<WrapSVInterfaceOp, UnwrapSVInterfaceOp>();
   pass1Target.addIllegalOp<PipelineStageOp>();

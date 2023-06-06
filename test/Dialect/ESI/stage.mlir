@@ -23,10 +23,16 @@ module {
 //  // We want to be able to give a module some AXIStream ports and it should be able to lower it correctly exposing
 //  // the raw signals that can then be found by Vivado for example.
 //
-//  hw.module @Stage3(%clk: i1, %rst: i1, %axisChan: !esi.channel<!esi.axistream<!hw.struct<x: i3, y: i3>, i64>, AXIStream>) -> () {
-//    %vrChan = esi.adapt.axistream2vr %clk, %rst, %axisChan : !esi.axistream<!hw.struct<x: i3, y: i3>, i64>
-//    hw.output
-//  }
+  hw.module @Stage3(%clk: i1, %rst: i1, %axisChan: !esi.channel<!esi.axistream<!hw.struct<x: i3, y: i3>, i64>, AXIStream>) -> () {
+    %vrChan = esi.adapt.axistream2vr %clk, %rst, %axisChan : !esi.axistream<!hw.struct<x: i3, y: i3>, i64>
+    hw.output
+  }
+
+  hw.module @Stage4(%clk: i1, %rst: i1) -> (axisChan: !esi.channel<!esi.axistream<!hw.struct<x: i3, y: i3>, i64>, AXIStream>) {
+    %chan = esi.null : !esi.channel<!hw.struct<x: i3, y: i3>>
+    %ac = esi.adapt.vr2axistream %clk, %rst, %chan : !esi.axistream<!hw.struct<x: i3, y: i3>, i64>
+    hw.output %ac : !esi.channel<!esi.axistream<!hw.struct<x: i3, y: i3>, i64>, AXIStream>
+  }
 //
 //  hw.module @Stage4(%clk: i1, %rst: i1, %chan: !esi.channel<i8>) -> () {
 //    hw.output

@@ -353,9 +353,7 @@ public:
 
   AXIStream(ChannelRewriter &rewriter, PortInfo origPort):
     SignalingStandard(rewriter, origPort) {
-    innerChanType = origPort.type.cast<ChannelType>().getInner();
-    byteFlattenedType = flattenType(innerChanType);
-    axisBusType = IntegerType::get(getContext(), 128, IntegerType::Signless);
+    streamType = origPort.type.cast<ChannelType>().getInner().cast<AXIStreamType>();
   }
 
   void mapInputSignals(OpBuilder &b, Operation *inst, Value instValue,
@@ -369,14 +367,9 @@ private:
   void buildInputSignals() override;
   void buildOutputSignals() override;
 
-  static Type flattenType(Type hwType);
+  AXIStreamType streamType;
 
-  Type innerChanType;
-  Type byteFlattenedType;
-  Type axisBusType;
-
-  PortInfo validPort, dataPort, strbPort, keepPort,
-    lastPort, idPort, destPort, userPort, wakeupPort;
+  PortInfo validPort, dataPort;
   PortInfo readyPort;
 };
 
@@ -656,51 +649,44 @@ void AXIStream::mapOutputSignals(OpBuilder &b, Operation *inst, Value instValue,
 }
 
 void AXIStream::buildInputSignals() {
-  assert(false && "not implemented");
-  // the original port is an input port
-
+  Type axisBusType = streamType.getAxisBusType();
   Type i1 = IntegerType::get(getContext(), 1, IntegerType::Signless);
-  Type i8 = IntegerType::get(getContext(), 8, IntegerType::Signless);
-  Type iN = IntegerType::get(getContext(), axisBusType.getIntOrFloatBitWidth() / 8, IntegerType::Signless);
 
   Value valid   = rewriter.createNewInput(origPort, "_TVALID",  i1, validPort);
   Value data    = rewriter.createNewInput(origPort, "_TDATA",   axisBusType, dataPort);
-  Value strb    = rewriter.createNewInput(origPort, "_TSTRB",   iN, strbPort);
-  Value keep    = rewriter.createNewInput(origPort, "_TKEEP",   iN, keepPort);
-  Value last    = rewriter.createNewInput(origPort, "_TLAST",   i1, lastPort);
-  Value id      = rewriter.createNewInput(origPort, "_TID",     i8, idPort);
-  Value dest    = rewriter.createNewInput(origPort, "_TDEST",   i8, destPort);
-  Value user    = rewriter.createNewInput(origPort, "_TUSER",   i8, userPort);
-  Value wakeup  = rewriter.createNewInput(origPort, "_TWAKEUP", i1, wakeupPort);
 
-  /*
   Value ready;
   if (body) {
     ImplicitLocOpBuilder b(origPort.loc, body, body->begin());
-    // Build the ESI wrap operation to translate the lowered signals to what
-    // they were. (A later pass takes care of eliminating the ESI ops.)
-    auto wrap = b.create<WrapAXIStreamOp>(
-      // TODO: not sure why ready type needs be specified here
-      TypeRange{origPort.type, i1},
-      valid, data, strb, keep, last, id, dest, user, wakeup
-    );
+    auto wrap = b.create<WrapAXIStreamOp>(valid, data, streamType);
     ready = wrap.getReady();
-    // Replace uses of the old ESI port argument with the new one from the
-    // wrap.
     body->getArgument(origPort.argNum).replaceAllUsesWith(wrap.getChanOutput());
   }
 
   rewriter.createNewOutput(origPort, "_TREADY", i1, ready, readyPort);
-   */
 }
 
 void AXIStream::buildOutputSignals() {
-  assert(false && "not implemented");
-}
+  Type axisBusType = streamType.getAxisBusType();
+  Type i1 = IntegerType::get(getContext(), 1, IntegerType::Signless);
 
-Type AXIStream::flattenType(Type hwType) {
-  // TODO: implement
-  return hwType;
+  Value ready = rewriter.createNewInput(origPort, "_TREADY", i1, readyPort);
+
+  Value valid, data;
+  if (body) {
+    auto *terminator = body->getTerminator(); // hw.output
+    ImplicitLocOpBuilder b(origPort.loc, terminator);
+    auto unwrap = b.create<UnwrapAXIStreamOp>(terminator->getOperand(origPort.argNum), ready);
+    valid = unwrap.getValid();
+    data = unwrap.getData();
+
+    data.getType().dump();
+  }
+
+  // TODO: make sure we are not forgetting anything here because of
+  // buildOutputDataPorts(data);
+  rewriter.createNewOutput(origPort, "_TVALID", i1, valid, validPort);
+  rewriter.createNewOutput(origPort, "_TDATA", axisBusType, data, dataPort);
 }
 
 /// Update an instance of an updated module by adding `esi.[un]wrap.vr`
