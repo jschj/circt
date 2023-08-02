@@ -20,6 +20,7 @@
 #include "circt/Dialect/ESI/cosim/dpi.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 
 using namespace circt::esi::cosim;

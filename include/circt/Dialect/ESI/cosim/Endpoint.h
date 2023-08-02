@@ -13,11 +13,13 @@
 #ifndef CIRCT_DIALECT_ESI_COSIM_ENDPOINT_H
 #define CIRCT_DIALECT_ESI_COSIM_ENDPOINT_H
 
+#include <cstdio>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 
 namespace circt {
 namespace esi {
